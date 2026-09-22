@@ -1,33 +1,36 @@
 /* ============================================================================
  * background.js — Service Worker (BỘ NÃO)
- * - Queue Manager: tối đa 10 tab ẩn cùng lúc
- * - Resolve AI (Gemini 2.5 Flash) + Spintax cho câu hỏi text
- * - Fail-safe 1: timeout 30s / tab  |  Fail-safe 2: API lỗi 3 lần liên tiếp
- * - Delay ngẫu nhiên Min–Max (phút) giữa các lượt submit
+ * - Chạy theo ĐỢT (barrier): mỗi đợt tối đa 10 tab; hết đợt mới sang đợt tiếp
+ * - Delay TRƯỚC khi tạo tab, mỗi tab 1 giá trị ngẫu nhiên Min–Max riêng
+ * - Resolve AI (Free.AI Chat, tương thích OpenAI) + Spintax cho câu hỏi text
+ * - Fail-safe 1: timeout 30s / tab (reset bằng heartbeat) | Fail-safe 2: API 3-Strike
  * ========================================================================== */
 
 // --- Hằng số cấu hình ---
 const MAX_CONCURRENT_TABS = 10;   // giới hạn đa nhiệm
 const TAB_TIMEOUT_MS = 30 * 1000; // Fail-safe 1: 30 giây / tab
 const API_MAX_STRIKE = 3;         // Fail-safe 2: 3 lỗi liên tiếp -> dừng hệ thống
-const GEMINI_MODEL = 'gemini-2.5-flash';
-const GEMINI_TIMEOUT_MS = 25 * 1000;
+const CHAT_API_URL = 'https://api.free.ai/v1/chat/';
+const DEFAULT_CHAT_MODEL = 'qwen7b';
+const CHAT_TIMEOUT_MS = 25 * 1000;
 
 // --- State toàn cục của 1 phiên chạy ---
 const state = {
   isRunning: false,
   runId: null,
   formUrl: null,
-  queue: [],            // mảng payload thô chờ xử lý (mỗi phần tử = 1 form)
+  queue: [],            // hàng đợi [{n: số thứ tự form, data: payload thô}]
   questionsMeta: {},    // { qid: {title, type} }
-  activeTabs: new Map(),// tabId -> { timeoutId, index }
+  activeTabs: new Map(),// tabId -> { timeoutId, index, submitted }
   pendingSend: new Map(), // tabId -> payload đã resolve, chờ tab load xong
+  waiters: new Map(),   // tabId -> resolve() của Promise mà đợt (batch) đang chờ
   stats: { total: 0, success: 0, failed: 0 },
   errorLog: [],       // nhật ký lỗi chi tiết [{index (số form), error, time}]
   apiErrorCount: 0,
   delayMin: 3,           // GIÂY giữa các lượt submit (user đổi trong popup)
   delayMax: 5,
   apiKey: null,
+  chatModel: DEFAULT_CHAT_MODEL,
   abortReason: null,
 };
 
@@ -89,30 +92,37 @@ function parseSpintax(text) {
 }
 
 /* ------------------------------------------------------------------
- * GEMINI 2.5 FLASH (Fail-safe 2: 3-Strike)
+ * FREE.AI CHAT (tương thích OpenAI, Fail-safe 2: 3-Strike)
+ * POST {CHAT_API_URL} {messages:[{role,user,content}], model}
  * ------------------------------------------------------------------ */
-async function callGemini(prompt, apiKey) {
+async function callChatAI(prompt, apiKey, model) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), CHAT_TIMEOUT_MS);
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const res = await fetch(url, {
+    const res = await fetch(CHAT_API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+      },
+      body: JSON.stringify({
+        model: model || DEFAULT_CHAT_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+      }),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error('Gemini HTTP ' + res.status + ': ' + (await res.text()).slice(0, 300));
+    if (!res.ok) throw new Error('Chat AI HTTP ' + res.status + ': ' + (await res.text()).slice(0, 300));
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('')?.trim();
-    if (!text) throw new Error('Gemini trả về rỗng.');
+    const ch = data && data.choices && data.choices[0];
+    const text = ch ? ((ch.message && ch.message.content) || ch.text || '').trim() : '';
+    if (!text) throw new Error('Chat AI trả về rỗng.');
     state.apiErrorCount = 0; // thành công -> reset bộ đếm
     return text;
   } catch (e) {
     state.apiErrorCount++;
     if (state.apiErrorCount >= API_MAX_STRIKE) {
       // Kích hoạt dừng khẩn cấp toàn hệ thống
-      abortAll('Dừng khẩn cấp: Gemini API lỗi 3 lần liên tiếp (' + (e.message || e) + ')');
+      abortAll('Dừng khẩn cấp: Chat AI lỗi 3 lần liên tiếp (' + (e.message || e) + ')');
     }
     throw e;
   } finally {
@@ -130,7 +140,7 @@ async function resolvePayload(rawPayload) {
       // 1. Parse Spintax trước, 2. thay {{question}} bằng tiêu đề thật, 3. gọi API
       const spun = parseSpintax(spec.prompt || '');
       const finalPrompt = spun.split('{{question}}').join(meta.title);
-      const answer = await callGemini(finalPrompt, state.apiKey);
+      const answer = await callChatAI(finalPrompt, state.apiKey, state.chatModel);
       items.push({ questionId: qid, title: meta.title, type: meta.type, answer });
       if (!state.isRunning) throw new Error('Đã dừng (abort trong lúc gọi AI).');
     } else {
@@ -141,35 +151,60 @@ async function resolvePayload(rawPayload) {
 }
 
 /* ------------------------------------------------------------------
- * QUEUE MANAGER (tối đa 10 tab ẩn)
+ * CHẠY THEO ĐỢT (BATCH) — DELAY TRƯỚC KHI TẠO TAB, MỖI TAB 1 DELAY RIÊNG
+ * - Mỗi đợt lấy tối đa 10 payload từ queue.
+ * - Mỗi tab nhận RIÊNG 1 delay ngẫu nhiên Min–Max (giây): sleep xong mới
+ *   resolve AI + tạo tab + điền (delay gắn với TAB, không gắn với đợt).
+ * - Các tab trong đợt chạy đồng thời (tối đa 10 tab); khi CẢ ĐỢT xong
+ *   (barrier) mới lấy đợt tiếp theo — các đợt không chạy song song.
  * ------------------------------------------------------------------ */
-async function pump() {
-  if (!state.isRunning) return;
-  // Mở tab mới cho đến khi đủ 10 tab hoặc hết hàng đợi
-  while (state.isRunning && state.activeTabs.size < MAX_CONCURRENT_TABS && state.queue.length > 0) {
-    const rawPayload = state.queue.shift();
-    const index = state.stats.success + state.stats.failed + state.activeTabs.size + 1;
-    // Resolve AI TRƯỚC khi mở tab (để tab mở ra là điền ngay, không chờ)
-    let resolved;
-    try {
-      resolved = await resolvePayload(rawPayload);
-    } catch (e) {
-      if (!state.isRunning) return; // đã abort (3-strike / user dừng)
-      // Lỗi AI lẻ (chưa đủ 3 strike): coi form này là failed, đi tiếp
-      state.stats.failed++;
-      logError(index, 'Lỗi Gemini khi sinh câu trả lời: ' + (e.message || e));
-      await persistStats();
-      checkFinished();
-      continue;
-    }
-    if (!state.isRunning) {
-      // Trong lúc resolve thì user bấm Dừng -> trả payload về queue rồi thoát
-      state.queue.unshift(rawPayload);
-      return;
-    }
-    await openTabForPayload(resolved, index);
+async function runBatches() {
+  while (state.isRunning && state.queue.length > 0) {
+    const batch = state.queue.splice(0, MAX_CONCURRENT_TABS);
+    await Promise.all(batch.map((item) => runOneWithDelay(item)));
   }
   checkFinished();
+}
+
+// 1 tab: nhận delay riêng -> chờ -> resolve AI -> tạo tab -> treo tới khi tab chốt
+async function runOneWithDelay(item) {
+  const { n, data } = item;
+  const d = randomDelayMs(); // mỗi tab 1 giá trị delay riêng trong khoảng Min–Max
+  await sleep(d);            // delay TRƯỚC khi tạo tab
+  if (!state.isRunning) { state.queue.unshift(item); return; }
+  let resolved;
+  try {
+    resolved = await resolvePayload(data);
+  } catch (e) {
+    if (!state.isRunning) { state.queue.unshift(item); return; }
+    // Lỗi AI lẻ (chưa đủ 3 strike): coi form này là failed, đợt tiếp tục
+    state.stats.failed++;
+    logError(n, 'Lỗi Chat AI khi sinh câu trả lời: ' + (e.message || e));
+    await persistStats();
+    return;
+  }
+  if (!state.isRunning) { state.queue.unshift(item); return; }
+  let tabId;
+  try {
+    tabId = await openTabForPayload(resolved, n);
+  } catch (e) {
+    if (!state.isRunning) { state.queue.unshift(item); return; }
+    state.stats.failed++;
+    logError(n, 'Không tạo được tab: ' + (e.message || e));
+    await persistStats();
+    return;
+  }
+  await waitForTab(tabId); // treo tới khi tab chốt (xong/lỗi/timeout) -> barrier của đợt
+}
+
+// Promise mà đợt đang chờ: resolve khi finalizeTab chốt tab tương ứng
+function waitForTab(tabId) {
+  return new Promise((resolve) => { state.waiters.set(tabId, resolve); });
+}
+
+function resolveWaiter(tabId) {
+  const w = state.waiters.get(tabId);
+  if (w) { state.waiters.delete(tabId); try { w(); } catch { /* bỏ qua */ } }
 }
 
 async function openTabForPayload(resolvedPayload, index) {
@@ -179,6 +214,7 @@ async function openTabForPayload(resolvedPayload, index) {
 
   armTabTimeout(tabId, index); // Fail-safe 1: 30s không heartbeat/báo cáo -> đóng tab
   await persistStats();
+  return tabId;
 }
 
 // Đặt (hoặc reset khi có heartbeat) bộ đếm timeout 30s cho 1 tab.
@@ -191,22 +227,13 @@ function armTabTimeout(tabId, index) {
     const cur = state.activeTabs.get(tabId);
     if (!cur) return;
     const wasSubmitted = !!cur.submitted;
-    state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
-    try { await chrome.tabs.remove(tabId); } catch { /* tab đã đóng */ }
-    if (state.isRunning) {
-      state.stats.failed++;
-      // Phân biệt 2 ca: đã bấm Submit nhưng không thấy trang cảm ơn (nghi captcha/
-      // xác minh) vs tab chết lặng từ đầu (kẹt/mạng).
-      const msg = wasSubmitted
-        ? `Form #${index} đã bấm Submit nhưng 30s vẫn chưa thấy trang cảm ơn (có thể dính captcha/xác minh), đã bỏ qua.`
-        : `Form #${index} timeout 30s (kẹt/mạng, không phản hồi), đã bỏ qua.`;
-      logError(index, msg);
-      await persistStats({ lastError: msg });
-      // Delay ngẫu nhiên rồi bơm tiếp để tránh dồn dập
-      await sleep(Math.min(randomDelayMs(), 10 * 1000)); // timeout retry chờ tối đa 10s
-      pump();
-    }
+    // Phân biệt 2 ca: đã bấm Submit nhưng không thấy trang cảm ơn (nghi captcha/
+    // xác minh) vs tab chết lặng từ đầu (kẹt/mạng). finalizeTab sẽ kill tab,
+    // ghi failed và giải phóng waiter để đợt (batch) không kẹt.
+    const msg = wasSubmitted
+      ? `Đã bấm Submit nhưng 30s vẫn chưa thấy trang cảm ơn (có thể dính captcha/xác minh), đã bỏ qua.`
+      : `Timeout 30s (kẹt/mạng, không phản hồi), đã bỏ qua.`;
+    await finalizeTab(tabId, false, msg);
   }, TAB_TIMEOUT_MS);
 
   const meta = state.activeTabs.get(tabId) || {};
@@ -234,31 +261,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'FILL_FORM', payload: job.payload, runId: job.runId });
   } catch {
-    // content.js chưa sẵn sàng (trang lỗi/Captcha): dọn tab, đánh failed
-    const meta = state.activeTabs.get(tabId);
-    if (meta) {
-      clearTimeout(meta.timeoutId);
-      state.activeTabs.delete(tabId);
-    }
-    try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
-    if (state.isRunning) {
-      state.stats.failed++;
-      const msg = `Form #${job.index ?? '?'}: không gửi được kịch bản tới tab (trang chặn/Captcha), đã bỏ qua.`;
-      logError(job.index ?? '?', msg);
-      await persistStats({ lastError: msg });
-      pump();
-    }
+    // content.js chưa sẵn sàng (trang lỗi/Captcha): chốt failed, đợt tiếp tục khi đủ
+    await finalizeTab(tabId, false, 'Không gửi được kịch bản tới tab (trang chặn/Captcha), đã bỏ qua.');
   }
 });
 
-// Tab bị user đóng tay -> dọn record, tránh kẹt bộ đếm active
+// Tab bị đóng (tay hoặc hệ thống) -> chốt failed để đợt (batch) không kẹt + giải phóng waiter.
+// finalizeTab idempotent nên việc đóng tab do chính hệ thống gọi cũng an toàn.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (state.activeTabs.has(tabId)) {
-    const meta = state.activeTabs.get(tabId);
-    clearTimeout(meta.timeoutId);
-    state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
-    await persistStats();
+    await finalizeTab(tabId, false, 'Tab bị đóng giữa chừng (đóng tay/lỗi trình duyệt), đã bỏ qua.');
   }
 });
 
@@ -272,7 +284,7 @@ async function finalizeTab(tabId, ok, error) {
   state.activeTabs.delete(tabId);
   state.pendingSend.delete(tabId);
   try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
-  if (!state.isRunning) { await persistStats(); return true; }
+  if (!state.isRunning) { await persistStats(); resolveWaiter(tabId); return true; }
 
   if (ok) state.stats.success++;
   else {
@@ -280,11 +292,8 @@ async function finalizeTab(tabId, ok, error) {
     logError(meta.index, `Form #${meta.index}: ` + error);
   }
   await persistStats(ok ? {} : { lastError: `Form #${meta.index}: ` + error });
-
-  // Delay ngẫu nhiên Min–Max trước khi mở form tiếp theo trong queue
-  const d = randomDelayMs();
-  setTimeout(() => pump(), d);
   checkFinished();
+  resolveWaiter(tabId); // thả barrier để đợt (batch) tiếp tục/kết thúc
   return true;
 }
 
@@ -296,7 +305,7 @@ function checkFinished() {
   }
 }
 
-// Dừng khẩn cấp: hủy queue, đóng mọi tab, reset AI-strike
+// Dừng khẩn cấp: hủy queue, đóng mọi tab, thả toàn bộ waiter để các đợt thoát
 async function abortAll(reason) {
   state.isRunning = false;
   state.abortReason = reason || 'Người dùng dừng khẩn cấp.';
@@ -308,6 +317,7 @@ async function abortAll(reason) {
   for (const tabId of tabs) {
     try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
   }
+  for (const tabId of [...state.waiters.keys()]) resolveWaiter(tabId);
   await persistStats();
 }
 
@@ -320,22 +330,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'START_RUN': {
         if (state.isRunning) { sendResponse({ ok: false, error: 'Đang có phiên chạy, hãy dừng trước.' }); return; }
         // API Key CHỈ lưu ở chrome.storage.session (tự xóa khi đóng trình duyệt)
-        await chrome.storage.session.set({ geminiApiKey: msg.apiKey || '' });
+        await chrome.storage.session.set({ chatApiKey: msg.apiKey || '' });
         state.apiKey = msg.apiKey || '';
+        state.chatModel = (msg.chatModel || '').trim() || DEFAULT_CHAT_MODEL;
         state.isRunning = true;
         state.runId = 'run_' + Date.now();
         state.formUrl = msg.formUrl;
-        state.queue = [...(msg.payloads || [])];
+        state.queue = (msg.payloads || []).map((p, i) => ({ n: i + 1, data: p })); // đánh số form
         state.questionsMeta = msg.questionsMeta || {};
         state.stats = { total: state.queue.length, success: 0, failed: 0 };
         state.errorLog = []; // reset nhật ký lỗi cho phiên chạy mới
+        state.waiters = new Map();
         state.apiErrorCount = 0;
         state.abortReason = null;
         state.delayMin = msg.delayMin;
         state.delayMax = msg.delayMax;
         await persistStats({ total: state.stats.total });
         sendResponse({ ok: true, runId: state.runId });
-        pump();
+        runBatches(); // chạy theo đợt, delay trước khi tạo tab
         break;
       }
       case 'STOP_RUN': {

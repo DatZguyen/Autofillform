@@ -2,7 +2,7 @@
  * popup.js — Giao diện cấu hình + Tracking
  * - Xin cấu trúc form từ content.js (EXTRACT_REQUEST)
  * - Render TẤT CẢ câu hỏi + câu trả lời, mỗi câu trả lời có ô % riêng
- * - Tick "Dùng Gemini AI" CHỈ hiện với câu nhập liệu (TEXT/PARAGRAPH);
+ * - Tick "Dùng AI (Free.AI)" CHỈ hiện với câu nhập liệu (TEXT/PARAGRAPH);
  *   khối Prompt ẨN cho tới khi tick vào
  * - Thuật toán Largest Remainder Method -> sinh mảng kịch bản (payloads)
  * - Gửi START_RUN cho background, theo dõi tiến độ (STATS_UPDATE)
@@ -14,7 +14,7 @@ let FORM_URL = null;
 
 // Loại chọn-1-đáp-án: dùng LRM để chia đúng tổng. Checkbox: % = xác suất độc lập.
 const SINGLE_CHOICE = new Set(['RADIO', 'DROPDOWN', 'SCALE', 'GRID']);
-// Loại ô nhập liệu: mới được hiện tickbox "Dùng Gemini AI"
+// Loại ô nhập liệu: mới được hiện tickbox "Dùng AI (Free.AI)"
 const TEXT_LIKE = new Set(['TEXT', 'PARAGRAPH']);
 
 /* ---------------- Khởi động: lấy form từ tab đang mở ---------------- */
@@ -158,10 +158,10 @@ function renderQuestions() {
         aiRow.className = 'ai-row';
         const cb = document.createElement('input');
         cb.type = 'checkbox'; cb.className = 'use-ai';
-        aiRow.append(cb, document.createTextNode(' Dùng Gemini AI'));
+        aiRow.append(cb, document.createTextNode(' Dùng AI (Free.AI)'));
         card.appendChild(aiRow);
 
-        // Khối Prompt ẨN mặc định — chỉ hiện khi tick "Dùng Gemini AI"
+        // Khối Prompt ẨN mặc định — chỉ hiện khi tick "Dùng AI (Free.AI)"
         const promptWrap = document.createElement('div');
         promptWrap.className = 'prompt-wrap';
         promptWrap.hidden = true;
@@ -439,6 +439,7 @@ async function onStart() {
   const delayMin = parseFloat(document.getElementById('inDelayMin').value);
   const delayMax = parseFloat(document.getElementById('inDelayMax').value);
   const apiKey = document.getElementById('inApiKey').value.trim();
+  const chatModel = (document.getElementById('inModel').value.trim() || 'qwen7b');
 
   if (!FORM_URL) { errEl.textContent = 'Chưa xác định được URL form.'; return; }
   if (!total || total < 1 || total > 1000) { errEl.textContent = 'Tổng số form phải từ 1–1000.'; return; }
@@ -501,7 +502,7 @@ async function onStart() {
       if (useAI) {
         const prompt = card.querySelector('.ai-prompt').value.trim();
         const aiPct = parseFloat(card.querySelector('.ai-pct').value) || 0;
-        if (!apiKey) { errEl.textContent = 'Bạn tick "Dùng AI" nhưng chưa nhập Gemini API Key.'; return; }
+        if (!apiKey) { errEl.textContent = 'Bạn tick "Dùng AI" nhưng chưa nhập Free.AI API Key.'; return; }
         if (!prompt) { errEl.textContent = `Câu "${q.title}": nhập Custom Prompt cho AI.`; return; }
         items.push({ kind: 'ai', prompt, pct: aiPct });
       }
@@ -588,7 +589,7 @@ async function onStart() {
   // Gửi cho background chạy queue
   const resp = await chrome.runtime.sendMessage({
     type: 'START_RUN',
-    formUrl: FORM_URL, payloads, questionsMeta, delayMin, delayMax, apiKey,
+    formUrl: FORM_URL, payloads, questionsMeta, delayMin, delayMax, apiKey, chatModel,
   });
   if (!resp?.ok) { errEl.textContent = resp?.error || 'Không khởi động được.'; return; }
   showTracking();
