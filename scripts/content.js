@@ -450,15 +450,23 @@
   }
 
   // Luồng fill chính: điền từng câu, xử lý phân trang, submit
-  async function runFill(payloadItems) {
+  async function runFill(payloadItems, runId) {
     // payloadItems: [{questionId, title, type, answer}]
     const maxPages = 20; // chống lặp vô hạn nếu logic rẽ nhánh lỗi
     let page = 0;
     const remaining = [...payloadItems];
     const errors = [];
+    let filled = 0;
+
+    // Heartbeat: báo background "tab vẫn sống, đang điền" để reset bộ đếm
+    // timeout 30s — tránh form nhiều trang/dài bị kết luận timeout oan dù vẫn chạy tốt.
+    const heartbeat = () => {
+      try { chrome.runtime.sendMessage({ type: 'FORM_HEARTBEAT', runId }); } catch { /* bỏ qua */ }
+    };
 
     while (page < maxPages) {
       await sleep(800); // chờ trang render
+      heartbeat(); // đầu mỗi trang
       // Điền mọi câu hỏi đang HIỂN THỊ trên trang hiện tại
       for (let i = remaining.length - 1; i >= 0; i--) {
         const item = remaining[i];
@@ -468,7 +476,11 @@
         if (block.offsetParent === null) continue;
         const res = await fillOne(item);
         await sleep(150 + Math.random() * 250); // delay ngẫu nhiên nhẹ giống người
-        if (res.ok) remaining.splice(i, 1);
+        if (res.ok) {
+          remaining.splice(i, 1);
+          filled++;
+          if (filled % 8 === 0) heartbeat(); // form dài: heartbeat giữa trang
+        }
         else errors.push(item.title + ': ' + (res.reason || 'không điền được'));
       }
 
@@ -483,12 +495,28 @@
           return { ok: false, error: 'Còn ' + remaining.length + ' câu chưa điền được: ' + remaining.map(r => r.title).join('; ') };
         }
         humanClick(nav.el);
-        await sleep(2500); // chờ trang xác nhận
-        const bodyTxt = norm(document.body.innerText);
-        if (/đã ghi lại|đã gửi|response.*recorded|thank you|cảm ơn/i.test(bodyTxt)) {
-          return { ok: true };
+        // Bắn báo "đã bấm submit" NGAY LẬP TỨC (không sleep trước), vì trang sắp
+        // chuyển sang trang cảm ơn và context script có thể bị hủy khi điều hướng.
+        try { chrome.runtime.sendMessage({ type: 'FORM_SUBMITTED', runId }); } catch { /* bỏ qua */ }
+        // Chờ trang cảm ơn tối đa ~8s (poll mỗi 1s). Nếu context chết giữa chừng
+        // do chuyển trang thì background sẽ tự chốt thành công qua URL formResponse.
+        for (let k = 0; k < 8; k++) {
+          await sleep(1000);
+          try {
+            if (/formResponse/i.test(location.href)) return { ok: true };
+            const bt = norm(document.body && document.body.innerText);
+            if (/đã ghi lại|đã gửi|response.*recorded|thank you|cảm ơn|your response has been recorded|đã được ghi/i.test(bt)) {
+              return { ok: true };
+            }
+          } catch { break; } // DOM đã hủy do chuyển trang -> background chốt qua URL
         }
-        return { ok: true }; // đã click submit, coi như xong (background sẽ đóng tab)
+        // Hết chờ mà vẫn ở trang form: lấy lỗi hiển thị (thiếu câu bắt buộc/kẹt captcha)
+        let pageErr = '';
+        try {
+          pageErr = [...document.querySelectorAll('[role="alert"]')]
+            .map((e) => norm(e.textContent)).filter(Boolean).slice(0, 3).join(' | ');
+        } catch { /* bỏ qua */ }
+        return { ok: false, error: 'Đã bấm Submit nhưng không thấy trang cảm ơn (thiếu câu bắt buộc/kẹt captcha?). ' + (pageErr ? 'Trang báo: ' + pageErr + '. ' : '') + 'Các nút đang thấy: ' + seenButtons() };
       } else {
         // Trang trung gian: bấm Tiếp để sang trang kế (kích hoạt logic rẽ nhánh)
         humanClick(nav.el);
@@ -517,7 +545,7 @@
       // Chạy async rồi báo về background (không dùng sendResponse vì cần thời gian dài)
       (async () => {
         try {
-          const res = await runFill(msg.payload || []);
+          const res = await runFill(msg.payload || [], msg.runId);
           chrome.runtime.sendMessage({
             type: res.ok ? 'FORM_DONE' : 'FORM_ERROR',
             runId: msg.runId, error: res.error || null

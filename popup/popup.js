@@ -112,8 +112,8 @@ function renderQuestions() {
         const info = document.createElement('div');
         info.className = 'hint';
         info.textContent = q.type === 'GRID'
-          ? 'Phân bổ % chung cho các CỘT (áp dụng cho mọi dòng). Tổng phải = 100%. Số % còn lại hiển thị ở dưới; nút 🎲 sẽ chia ngẫu nhiên phần còn lại cho các ô còn trống.'
-          : 'Nhập % cho từng đáp án. Tổng phải = 100%. Số % còn lại hiển thị ở dưới; nút 🎲 sẽ chia ngẫu nhiên phần còn lại cho các ô còn trống.';
+          ? 'Phân bổ % chung cho các CỘT (áp dụng cho mọi dòng). Tổng phải = 100%. Số % còn lại hiển thị ở dưới; nút 🎲/⚖ sẽ chia (ngẫu nhiên/đều) phần còn lại cho các ô còn trống.'
+          : 'Nhập % cho từng đáp án. Tổng phải = 100%. Số % còn lại hiển thị ở dưới; nút 🎲/⚖ sẽ chia (ngẫu nhiên/đều) phần còn lại cho các ô còn trống.';
         card.appendChild(info);
         const cols = q.options;
         // Mặc định để TRỐNG tất cả ô % — người dùng tự nhập hoặc bấm 🎲 chia ngẫu nhiên
@@ -287,22 +287,28 @@ function sumPct(card, selector) {
   return visiblePctInputs(card, selector).reduce((a, el) => a + (parseFloat(el.value) || 0), 0);
 }
 
-// Vẽ thanh "Còn lại: X%" + nút chia ngẫu nhiên; tự cập nhật live khi người dùng gõ
+// Vẽ thanh "Còn lại: X%" + 2 nút chia (ngẫu nhiên / đều); tự cập nhật live khi gõ
 function remainderFooter(card, selector) {
   card.dataset.pctSel = selector;
   const bar = document.createElement('div');
   bar.className = 'pct-bar';
   const rem = document.createElement('span');
   rem.className = 'remain-lb';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'rand-btn';
-  btn.textContent = '🎲 Chia ngẫu nhiên';
-  btn.title = 'Chia ngẫu nhiên số % còn lại cho các ô TRỐNG, giữ nguyên các ô đã nhập';
+  const btnRand = document.createElement('button');
+  btnRand.type = 'button';
+  btnRand.className = 'rand-btn';
+  btnRand.textContent = '🎲 Ngẫu nhiên';
+  btnRand.title = 'Chia ngẫu nhiên số % còn lại cho các ô TRỐNG, giữ nguyên các ô đã nhập';
+  const btnEven = document.createElement('button');
+  btnEven.type = 'button';
+  btnEven.className = 'rand-btn';
+  btnEven.textContent = '⚖ Chia đều';
+  btnEven.title = 'Chia đều số % còn lại cho các ô TRỐNG, giữ nguyên các ô đã nhập';
   const msg = document.createElement('span');
   msg.className = 'rand-msg hint';
-  btn.addEventListener('click', () => randomSplit(card, selector, rem, msg));
-  bar.append(btn, rem);
+  btnRand.addEventListener('click', () => randomSplit(card, selector, rem, msg));
+  btnEven.addEventListener('click', () => evenSplit(card, selector, rem, msg));
+  bar.append(btnRand, btnEven, rem);
   const wrap = document.createElement('div');
   wrap.append(bar, msg);
   // Cập nhật live mỗi khi gõ trong card (chỉ đọc các ô % nên không ảnh hưởng ô text)
@@ -327,20 +333,28 @@ function refreshCard(card) {
   updateRemain(card, card.dataset.pctSel, rem);
 }
 
-// Chia NGẪU NHIÊN số % còn lại cho các ô TRỐNG, không đụng tới ô đã nhập.
-// VD: A=20 (đã nhập), B và C trống -> còn 80% chia ngẫu nhiên cho B, C (tổng B+C=80).
-function randomSplit(card, selector, remEl, msgEl) {
+// Kiểm tra điều kiện chung trước khi chia: còn dư? còn ô trống?
+// Trả về {blanks, rest} hoặc null (đã hiện thông báo lỗi vào msgEl).
+function splitPrecheck(card, selector, msgEl) {
   const inputs = visiblePctInputs(card, selector);
   const blanks = inputs.filter((el) => el.value.trim() === ''); // chỉ ô chưa nhập
   const rest = 100 - sumPct(card, selector);
   msgEl.textContent = '';
-  if (rest < -0.001) { msgEl.textContent = '⚠️ Tổng đã vượt 100%. Hãy giảm bớt rồi chia lại.'; return; }
-  if (rest <= 0.001) { msgEl.textContent = 'Đã đủ 100%, không còn gì để chia.'; return; }
-  if (!blanks.length) { msgEl.textContent = 'Không có ô trống — hãy xóa giá trị một ô rồi bấm chia lại.'; return; }
+  if (rest < -0.001) { msgEl.textContent = '⚠️ Tổng đã vượt 100%. Hãy giảm bớt rồi chia lại.'; return null; }
+  if (rest <= 0.001) { msgEl.textContent = 'Đã đủ 100%, không còn gì để chia.'; return null; }
+  if (!blanks.length) { msgEl.textContent = 'Không có ô trống — hãy xóa giá trị một ô rồi bấm chia lại.'; return null; }
+  return { blanks, rest };
+}
+
+// Chia NGẪU NHIÊN số % còn lại cho các ô TRỐNG, không đụng tới ô đã nhập.
+// VD: A=20 (đã nhập), B và C trống -> còn 80% chia ngẫu nhiên cho B, C (tổng B+C=80).
+function randomSplit(card, selector, remEl, msgEl) {
+  const pre = splitPrecheck(card, selector, msgEl);
+  if (!pre) return;
   // Chia ngẫu nhiên thành số nguyên, ô cuối nhận phần còn lại để tổng khớp tuyệt đối
-  let left = Math.round(rest);
-  blanks.forEach((el, i) => {
-    if (i === blanks.length - 1) el.value = left;
+  let left = Math.round(pre.rest);
+  pre.blanks.forEach((el, i) => {
+    if (i === pre.blanks.length - 1) el.value = left;
     else {
       const v = Math.floor(Math.random() * (left + 1));
       el.value = v;
@@ -350,8 +364,23 @@ function randomSplit(card, selector, remEl, msgEl) {
   // Hiệu chỉnh sai số làm tròn thập phân (khi % còn lại không phải số nguyên)
   const diff = 100 - sumPct(card, selector);
   if (Math.abs(diff) > 0.001) {
-    blanks[blanks.length - 1].value = (parseFloat(blanks[blanks.length - 1].value) || 0) + Math.round(diff * 100) / 100;
+    pre.blanks[pre.blanks.length - 1].value = (parseFloat(pre.blanks[pre.blanks.length - 1].value) || 0) + Math.round(diff * 100) / 100;
   }
+  updateRemain(card, selector, remEl);
+}
+
+// Chia ĐỀU số % còn lại cho các ô TRỐNG, không đụng tới ô đã nhập.
+// VD: còn 80%, 2 ô trống -> 40/40 (ô đầu nhận phần dư nếu chia không hết).
+function evenSplit(card, selector, remEl, msgEl) {
+  const pre = splitPrecheck(card, selector, msgEl);
+  if (!pre) return;
+  const n = pre.blanks.length;
+  const base = Math.floor(pre.rest / n);
+  pre.blanks.forEach((el, i) => {
+    el.value = i === 0
+      ? Math.round((pre.rest - base * (n - 1)) * 100) / 100
+      : base;
+  });
   updateRemain(card, selector, remEl);
 }
 
@@ -413,7 +442,7 @@ async function onStart() {
 
   if (!FORM_URL) { errEl.textContent = 'Chưa xác định được URL form.'; return; }
   if (!total || total < 1 || total > 1000) { errEl.textContent = 'Tổng số form phải từ 1–1000.'; return; }
-  if (!(delayMin >= 0) || !(delayMax >= 0) || delayMax < delayMin) { errEl.textContent = 'Delay Min/Max (phút) không hợp lệ (Max ≥ Min ≥ 0).'; return; }
+  if (!(delayMin >= 0) || !(delayMax >= 0) || delayMax < delayMin) { errEl.textContent = 'Delay Min/Max (giây) không hợp lệ (Max ≥ Min ≥ 0).'; return; }
 
   // Đọc cấu hình từng câu hỏi từ DOM
   const cards = [...document.querySelectorAll('.q-card')];
