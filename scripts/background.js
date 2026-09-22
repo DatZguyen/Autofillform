@@ -25,8 +25,8 @@ const state = {
   stats: { total: 0, success: 0, failed: 0 },
   errorLog: [],       // nhật ký lỗi chi tiết [{index (số form), error, time}]
   apiErrorCount: 0,
-  delayMin: 0.05,       // phút (mặc định 3 giây để dễ test; user đổi trong popup)
-  delayMax: 0.1,
+  delayMin: 3,           // GIÂY giữa các lượt submit (user đổi trong popup)
+  delayMax: 5,
   apiKey: null,
   abortReason: null,
 };
@@ -36,11 +36,11 @@ const state = {
  * ------------------------------------------------------------------ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.random() * (b - a);
-// Delay ngẫu nhiên Min–Max (đơn vị PHÚT theo spec) -> đổi ra ms
+// Delay ngẫu nhiên Min–Max (đơn vị GIÂY, đồng bộ với hiển thị ở popup) -> đổi ra ms
 function randomDelayMs() {
   const lo = Math.max(0, Number(state.delayMin) || 0);
   const hi = Math.max(lo, Number(state.delayMax) || lo);
-  return rand(lo, hi) * 60 * 1000;
+  return rand(lo, hi) * 1000;
 }
 
 // Ghi 1 dòng lỗi chi tiết (form số mấy, lỗi gì, ở đâu) — popup hiển thị khi chạy xong
@@ -177,15 +177,30 @@ async function openTabForPayload(resolvedPayload, index) {
   const tabId = tab.id;
   state.pendingSend.set(tabId, { payload: resolvedPayload, runId: state.runId, index });
 
-  // Fail-safe 1: sau 30s không báo cáo -> đóng tab, đánh failed, chạy tiếp
+  armTabTimeout(tabId, index); // Fail-safe 1: 30s không heartbeat/báo cáo -> đóng tab
+  await persistStats();
+}
+
+// Đặt (hoặc reset khi có heartbeat) bộ đếm timeout 30s cho 1 tab.
+// Chỉ tab "chết lặng" (kẹt/Captcha/rớt mạng, không heartbeat) mới bị đóng oan tránh;
+// tab đang điền form dài vẫn heartbeat đều nên không bao giờ bị giết giữa chừng.
+function armTabTimeout(tabId, index) {
+  const old = state.activeTabs.get(tabId);
+  if (old) clearTimeout(old.timeoutId);
   const timeoutId = setTimeout(async () => {
-    if (!state.activeTabs.has(tabId)) return;
+    const cur = state.activeTabs.get(tabId);
+    if (!cur) return;
+    const wasSubmitted = !!cur.submitted;
     state.activeTabs.delete(tabId);
     state.pendingSend.delete(tabId);
     try { await chrome.tabs.remove(tabId); } catch { /* tab đã đóng */ }
     if (state.isRunning) {
       state.stats.failed++;
-      const msg = `Form #${index} timeout 30s (kẹt/Captcha/mạng), đã bỏ qua.`;
+      // Phân biệt 2 ca: đã bấm Submit nhưng không thấy trang cảm ơn (nghi captcha/
+      // xác minh) vs tab chết lặng từ đầu (kẹt/mạng).
+      const msg = wasSubmitted
+        ? `Form #${index} đã bấm Submit nhưng 30s vẫn chưa thấy trang cảm ơn (có thể dính captcha/xác minh), đã bỏ qua.`
+        : `Form #${index} timeout 30s (kẹt/mạng, không phản hồi), đã bỏ qua.`;
       logError(index, msg);
       await persistStats({ lastError: msg });
       // Delay ngẫu nhiên rồi bơm tiếp để tránh dồn dập
@@ -194,12 +209,24 @@ async function openTabForPayload(resolvedPayload, index) {
     }
   }, TAB_TIMEOUT_MS);
 
-  state.activeTabs.set(tabId, { timeoutId, index });
-  await persistStats();
+  const meta = state.activeTabs.get(tabId) || {};
+  state.activeTabs.set(tabId, { ...meta, timeoutId, index });
 }
 
 // Khi tab load xong -> gửi kịch bản cho content.js điền
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  // Trang cảm ơn sau submit có URL chứa "formResponse" -> chốt THÀNH CÔNG + kill tab
+  // NGAY LẬP TỨC, không chờ content báo (script trong tab có thể đã chết khi chuyển trang).
+  if (changeInfo.status === 'complete' || changeInfo.url) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab && /formResponse/i.test(tab.url || '') && state.activeTabs.has(tabId)) {
+        await finalizeTab(tabId, true, null);
+        return;
+      }
+    } catch { /* tab đã đóng */ }
+  }
+
   if (changeInfo.status !== 'complete') return;
   const job = state.pendingSend.get(tabId);
   if (!job || job.runId !== state.runId) return;
@@ -235,14 +262,17 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
-// Xử lý báo cáo từ content.js
-async function handleTabResult(tabId, ok, error) {
+// Chốt 1 tab (thành công/thất bại): kill tab ngay, ghi nhận, bơm tiếp.
+// Idempotent: tab đã chốt/timeout trước đó thì bỏ qua (tránh đếm trùng khi cả
+// URL formResponse lẫn FORM_DONE cùng tới).
+async function finalizeTab(tabId, ok, error) {
   const meta = state.activeTabs.get(tabId);
-  if (!meta) return; // tab lạ / đã timeout
+  if (!meta) return false; // tab lạ / đã chốt / đã timeout
   clearTimeout(meta.timeoutId);
   state.activeTabs.delete(tabId);
+  state.pendingSend.delete(tabId);
   try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
-  if (!state.isRunning) { await persistStats(); return; }
+  if (!state.isRunning) { await persistStats(); return true; }
 
   if (ok) state.stats.success++;
   else {
@@ -255,6 +285,7 @@ async function handleTabResult(tabId, ok, error) {
   const d = randomDelayMs();
   setTimeout(() => pump(), d);
   checkFinished();
+  return true;
 }
 
 function checkFinished() {
@@ -318,13 +349,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case 'FORM_DONE': {
         if (msg.runId !== state.runId) { sendResponse({ ack: true }); return; }
-        await handleTabResult(sender.tab.id, true, null);
+        await finalizeTab(sender.tab.id, true, null);
+        sendResponse({ ack: true });
+        break;
+      }
+      case 'FORM_SUBMITTED': {
+        // Content vừa bấm Submit -> đánh dấu + reset bộ đếm 30s chờ trang cảm ơn
+        if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
+        const meta = state.activeTabs.get(sender.tab.id);
+        if (meta && state.isRunning) {
+          meta.submitted = true;
+          armTabTimeout(sender.tab.id, meta.index);
+        }
+        sendResponse({ ack: true });
+        break;
+      }
+      case 'FORM_HEARTBEAT': {
+        // Tab báo "vẫn sống, đang điền" -> reset bộ đếm timeout 30s của tab đó
+        if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
+        const meta = state.activeTabs.get(sender.tab.id);
+        if (meta && state.isRunning) armTabTimeout(sender.tab.id, meta.index);
         sendResponse({ ack: true });
         break;
       }
       case 'FORM_ERROR': {
         if (msg.runId !== state.runId) { sendResponse({ ack: true }); return; }
-        await handleTabResult(sender.tab.id, false, msg.error);
+        await finalizeTab(sender.tab.id, false, msg.error);
         sendResponse({ ack: true });
         break;
       }
