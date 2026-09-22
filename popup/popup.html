@@ -33,8 +33,11 @@
           <input id="inDelayMax" type="number" min="0" step="1" value="5" />
         </label>
       </div>
-      <label>Gemini API Key <span class="hint">(chỉ lưu session, tự xóa khi đóng trình duyệt)</span>
-        <input id="inApiKey" type="password" placeholder="AIza…" autocomplete="off" />
+      <label>Free.AI API Key <span class="hint">(dạng sk-free-…, chỉ lưu session, tự xóa khi đóng trình duyệt)</span>
+        <input id="inApiKey" type="password" placeholder="sk-free-…" autocomplete="off" />
+      </label>
+      <label>Chat Model
+        <input id="inModel" type="text" value="qwen7b" placeholder="vd: qwen7b" autocomplete="off" />
       </label>
       <div id="configError" class="error"></div>
       <button id="btnStart" class="btn primary" disabled>Bắt đầu chạy ▶</button>

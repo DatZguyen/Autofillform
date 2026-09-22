@@ -70,7 +70,7 @@ label { display: block; margin: 8px 0 2px; font-weight: 600; }
 .stat b { font-size: 18px; }
 .stat.ok b { color: #2e7d32; } .stat.err b { color: #c62828; } .stat.run b { color: #e65100; }
 .ai-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-weight: 600; }
-/* --- Khối prompt AI (ẩn cho tới khi tick "Dùng Gemini AI") --- */
+/* --- Khối prompt AI (ẩn cho tới khi tick "Dùng AI (Free.AI)") --- */
 .prompt-wrap {
   background: #f3e8fd; border: 1px dashed #673ab7;
   border-radius: 6px; padding: 8px; margin: 6px 0;
