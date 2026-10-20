@@ -1,0 +1,119 @@
+/* Forms AI Auto-Fill — Popup style (nhỏ gọn, tiếng Việt) */
+* { box-sizing: border-box; }
+body {
+  width: 420px; max-height: 600px; overflow-y: auto;
+  margin: 0; padding: 0; font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 13px; color: #202124; background: #f8f9fa;
+}
+.app-header {
+  display: flex; gap: 10px; align-items: center;
+  background: #673ab7; color: #fff; padding: 12px 14px;
+  position: sticky; top: 0; z-index: 5;
+}
+.app-header .logo { font-size: 26px; }
+.app-header h1 { font-size: 15px; margin: 0; }
+.form-title { margin: 2px 0 0; font-size: 11px; opacity: .85; }
+section { padding: 12px 14px; }
+.notice {
+  background: #e8eaf6; border-left: 4px solid #673ab7;
+  padding: 8px 10px; border-radius: 4px; margin-bottom: 10px;
+}
+.notice.small { font-size: 11px; background: #fff3e0; border-color: #ff9800; }
+.error { color: #c62828; font-size: 12px; margin: 6px 0; min-height: 16px; }
+.q-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.q-card {
+  background: #fff; border: 1px solid #dadce0; border-radius: 8px; padding: 10px;
+}
+.q-card h3 { margin: 0 0 2px; font-size: 13px; }
+.q-type {
+  display: inline-block; font-size: 10px; background: #ede7f6; color: #4527a0;
+  padding: 1px 7px; border-radius: 10px; margin-bottom: 6px;
+}
+.opt-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+.opt-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.opt-row input[type="number"] { width: 64px; }
+input[type="text"], input[type="number"], input[type="password"], textarea {
+  width: 100%; padding: 6px 8px; border: 1px solid #dadce0; border-radius: 6px;
+  font-size: 13px; font-family: inherit;
+}
+textarea { resize: vertical; min-height: 44px; }
+label { display: block; margin: 8px 0 2px; font-weight: 600; }
+.hint { font-weight: 400; color: #5f6368; font-size: 11px; }
+.row2 { display: flex; gap: 8px; }
+.row2 > * { flex: 1; }
+.global-box {
+  background: #fff; border: 1px solid #dadce0; border-radius: 8px; padding: 10px;
+}
+.global-box legend { font-weight: 700; color: #673ab7; padding: 0 6px; }
+.btn {
+  width: 100%; padding: 9px; margin-top: 8px; border: none; border-radius: 6px;
+  font-size: 14px; font-weight: 700; cursor: pointer;
+}
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: #673ab7; color: #fff; }
+.btn.danger { background: #d32f2f; color: #fff; }
+.btn.ghost { background: #e0e0e0; color: #333; }
+.progress-wrap { text-align: center; margin-bottom: 10px; }
+.progress-bar {
+  height: 18px; background: #e0e0e0; border-radius: 10px; overflow: hidden;
+}
+#progressFill {
+  height: 100%; width: 0%; background: linear-gradient(90deg, #673ab7, #9c27b0);
+  transition: width .4s;
+}
+.progress-text { margin-top: 4px; font-weight: 700; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.stat {
+  background: #fff; border: 1px solid #dadce0; border-radius: 8px;
+  padding: 8px; text-align: center; font-size: 12px;
+}
+.stat b { font-size: 18px; }
+.stat.ok b { color: #2e7d32; } .stat.err b { color: #c62828; } .stat.run b { color: #e65100; }
+.ai-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-weight: 600; }
+/* --- Khối prompt AI (ẩn cho tới khi tick "Dùng Gemini AI") --- */
+.prompt-wrap {
+  background: #f3e8fd; border: 1px dashed #673ab7;
+  border-radius: 6px; padding: 8px; margin: 6px 0;
+}
+.prompt-wrap textarea { background: #fff; }
+/* --- Danh sách biến thể câu trả lời cho câu nhập liệu --- */
+.variant-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.variant-row .variant-text { flex: 1; width: auto; min-width: 0; }
+.variant-row .variant-pct { width: 60px; flex: none; }
+.pct-lb { flex: none; color: #5f6368; }
+.mini-btn {
+  flex: none; border: 1px solid #dadce0; background: #fff; border-radius: 6px;
+  cursor: pointer; padding: 4px 8px; color: #c62828; font-size: 12px;
+}
+.mini-btn:hover { background: #fce8e6; }
+.btn.add-btn {
+  background: #fff; color: #673ab7; border: 1px dashed #673ab7;
+  font-size: 12px; padding: 6px;
+}
+/* --- Thanh "Còn lại %" + nút chia ngẫu nhiên --- */
+.pct-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 8px; padding-top: 8px; border-top: 1px dashed #dadce0;
+}
+.remain-lb { font-weight: 700; font-size: 13px; color: #e65100; margin-left: auto; }
+.remain-lb.done { color: #2e7d32; }
+.remain-lb.neg { color: #c62828; }
+.rand-btn {
+  border: 1px solid #673ab7; background: #ede7f6; color: #4527a0;
+  border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.rand-btn:hover { background: #d1c4e9; }
+.rand-msg { display: block; margin-top: 2px; min-height: 14px; }
+/* --- Ô nhập nội dung cho đáp án "Mục khác:" --- */
+.other-text-wrap { background: #fff8e1; border-radius: 6px; padding: 4px 6px; }
+.other-text-wrap .other-text { flex: 1; width: auto; min-width: 0; }
+/* --- Danh sách lỗi chi tiết --- */
+.err-head { font-weight: 700; margin: 8px 0 4px; color: #c62828; }
+.err-list {
+  max-height: 180px; overflow-y: auto; background: #fff;
+  border: 1px solid #dadce0; border-radius: 6px; padding: 6px 8px;
+  display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;
+}
+.err-item { font-size: 12px; border-bottom: 1px dotted #e0e0e0; padding-bottom: 3px; }
+.err-item b { color: #c62828; }
+.opt-row input[type="number"] { flex: none; }
