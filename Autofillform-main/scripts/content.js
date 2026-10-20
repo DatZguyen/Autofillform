@@ -1,29 +1,21 @@
 /* ============================================================================
- * content.js — Chạy trên trang Google Forms
- * 2 nhiệm vụ:
- *  (1) BÓC TÁCH: quét <script> chứa FB_PUBLIC_LOAD_DATA_, parse JSON lấy full
- *      cấu trúc form (kể cả trang ẩn / nhiều trang / rẽ nhánh) -> gửi về Popup.
- *  (2) AUTO-FILL: nhận 1 kịch bản (payload) từ background, click/điền DOM,
- *      qua trang, bấm Submit, báo kết quả về background.
+ * content.js — Chạy trên trang Google Forms (ĐÃ FIX LỖI FALSE-POSITIVE DONE & CLICK NAV)
  * ========================================================================== */
 (() => {
   'use strict';
 
-  // --- Bảng map typeId của Google Forms sang loại nội bộ ---
-  // 0: text ngắn, 1: paragraph, 2: radio, 3: dropdown, 4: checkbox,
-  // 5: linear scale, 6: section/title, 7: grid (choice grid),
-  // 8: page break (ngắt trang), 9: date, 10: time, 11: image, 12: video
   const TYPE_MAP = {
     0: 'TEXT', 1: 'PARAGRAPH', 2: 'RADIO', 3: 'DROPDOWN',
     4: 'CHECKBOX', 5: 'SCALE', 6: 'SECTION', 7: 'GRID',
     8: 'PAGE_BREAK', 9: 'DATE', 10: 'TIME', 11: 'IMAGE', 12: 'VIDEO'
   };
 
+  let activeFillingRunId = null;
+
   /* ------------------------------------------------------------------
-   * (1) BÓC TÁCH FB_PUBLIC_LOAD_DATA_ (Hỗ trợ đầy đủ Multi-Page)
+   * (1) BÓC TÁCH FB_PUBLIC_LOAD_DATA_
    * ------------------------------------------------------------------ */
 
-  // Cắt mảng JSON bằng bộ đếm độ sâu ngoặc vuông [] (an toàn khi script có nhiều lệnh)
   function extractJsonArray(str, startIndex) {
     let depth = 0;
     let inString = false;
@@ -55,7 +47,6 @@
     return null;
   }
 
-  // Tìm chuỗi JSON của biến FB_PUBLIC_LOAD_DATA_ trong các thẻ <script>.
   function findLoadDataRaw() {
     const scripts = document.querySelectorAll('script');
     for (const s of scripts) {
@@ -66,7 +57,6 @@
         if (start !== -1) {
           const extracted = extractJsonArray(txt, start);
           if (extracted) return extracted;
-          // Fallback nếu cắt ngoặc thất bại
           const end = txt.lastIndexOf(';');
           if (end !== -1 && end > start) {
             return txt.slice(start, end).trim();
@@ -77,45 +67,40 @@
     return null;
   }
 
-  // Parse an toàn: FB data là JSON hợp lệ (đã escape), chỉ cần JSON.parse.
   function parseLoadData(raw) {
     let s = raw.trim();
     while (s.endsWith(';')) s = s.slice(0, -1).trim();
     return JSON.parse(s);
   }
 
-  // Nhận diện đáp án "Mục khác / Other": khi chọn sẽ hiện textbox riêng để nhập.
   const OTHER_RE = /^(other|khác|mục khác|otro|autre|altro|ander(e|o)?s?)\s*:?$/i;
-  const OTHER_VALUE = '__other_option__'; // data-value của radio/checkbox "Other" trên DOM
+  const OTHER_VALUE = '__other_option__';
 
-  // Chuẩn hóa 1 tuple đáp án FB thành {t: text, other} (other='maybe' = slot rỗng chưa rõ).
-  // Trong FB_PUBLIC_LOAD_DATA_, tuple đáp án có dạng: [text, null, null, null, isOtherFlag]
-  // Nếu o[4] === 1 thì chắc chắn 100% là đáp án "Mục khác / Other" (kể cả ở trang ẩn).
   function normOptionTuple(o) {
     if (Array.isArray(o)) {
       if (o[4] === 1) {
         const label = typeof o[0] === 'string' && o[0].trim() !== '' ? o[0] : 'Mục khác:';
         return { t: label, other: true };
       }
-      if (typeof o[0] === 'string') {
-        const t = o[0].trim();
+      if (typeof o[0] === 'string' || typeof o[0] === 'number') {
+        const rawStr = String(o[0]);
+        const t = rawStr.trim();
         if (t === '') return { t: '', other: 'maybe' };
-        return { t: o[0], other: OTHER_RE.test(t) };
+        return { t: rawStr, other: OTHER_RE.test(t) };
       }
-      // Slot "Other" đôi khi serialize thành null / [null, ...]
       if (o.length === 0 || o[0] === null || o[0] === undefined) return { t: '', other: 'maybe' };
       return null;
     }
-    if (typeof o === 'string') {
-      const t = o.trim();
+    if (typeof o === 'string' || typeof o === 'number') {
+      const rawStr = String(o);
+      const t = rawStr.trim();
       if (t === '') return null;
-      return { t: o, other: OTHER_RE.test(t) };
+      return { t: rawStr, other: OTHER_RE.test(t) };
     }
     if (o === null || o === undefined) return { t: '', other: 'maybe' };
     return null;
   }
 
-  // Thử đọc node (hoặc node[0] khi lồng thêm 1 cấp) thành danh sách options.
   function normalizeOptionList(node) {
     if (!Array.isArray(node) || node.length === 0) return [];
     const candidates = [node];
@@ -126,18 +111,20 @@
         const n = normOptionTuple(o);
         if (n) out.push(n);
       }
-      // Chỉ nhận khi có ít nhất 1 đáp án text thật hoặc Other xác thực
       if (out.some((x) => (x.other !== 'maybe' && x.t !== '') || x.other === true)) return out;
     }
     return [];
   }
 
-  // Trích options cho câu trắc nghiệm — thử nhiều đường dẫn (mỗi bản Forms lồng khác nhau).
   function extractOptions(entry) {
     try {
       const e4 = entry[4];
-      if (!Array.isArray(e4)) return [];
-      const roots = [e4[0], e4[0] && e4[0][1], e4];
+      if (!Array.isArray(e4) || e4.length === 0) return [];
+      const roots = [
+        e4[0] && e4[0][1],
+        e4[0],
+        e4
+      ];
       for (const r of roots) {
         const list = normalizeOptionList(r);
         if (list.length) return list;
@@ -146,27 +133,27 @@
     } catch { return []; }
   }
 
-  // Quét DOM bổ sung đáp án (fallback khi FB thiếu; và để phát hiện nút "Mục khác:").
   function scrapeOptionsFromDOM(title, type) {
-    if (type !== 'RADIO' && type !== 'CHECKBOX' && type !== 'SCALE') return [];
+    if (type !== 'RADIO' && type !== 'CHECKBOX' && type !== 'SCALE' && type !== 'GRID') return [];
     try {
       const block = findQuestionBlock(title);
       if (!block) return [];
-      const role = 'div[role="' + (type === 'CHECKBOX' ? 'checkbox' : 'radio') + '"]';
-      const els = block.querySelectorAll(role);
+      const roleSelector = type === 'CHECKBOX' ? 'div[role="checkbox"]' : 'div[role="radio"]';
+      const scope = (type === 'GRID' && block.querySelector('div[role="radiogroup"]:not([aria-hidden="true"]), div[role="group"]:not([aria-hidden="true"])')) || block;
+      const els = scope.querySelectorAll(roleSelector);
       const out = [];
       els.forEach((el) => {
+        if (el.getAttribute('aria-disabled') === 'true' || el.closest('[aria-hidden="true"]')) return;
         const v = el.getAttribute('data-value') || '';
-        const label = norm(el.getAttribute('aria-label') || el.textContent);
+        const label = norm(v || el.getAttribute('aria-label') || el.textContent);
+        if (!v && !label) return;
         const isOther = v === OTHER_VALUE || (label !== '' && OTHER_RE.test(label));
-        out.push({ value: v, label, isOther });
+        out.push({ value: v, label: v || label, isOther });
       });
       return out;
     } catch { return []; }
   }
 
-  // Gộp đáp án FB + DOM: ưu tiên FB, thêm cái DOM có mà FB thiếu, chốt trạng thái Other.
-  // Hỗ trợ câu hỏi nằm ở trang sau (khi block DOM chưa được render).
   function mergeWithDom(fbOpts, title, type) {
     let dom = [];
     let isRenderedOnDom = false;
@@ -187,14 +174,12 @@
         continue;
       }
       if (x.other === 'maybe') {
-        // Nếu câu hỏi đang hiển thị trên DOM trang 1: kiểm tra domHasOther.
-        // Nếu câu hỏi ở trang ẩn (isRenderedOnDom === false): giữ lại làm Other để không mất đáp án.
         if (domHasOther || !isRenderedOnDom) {
           if (!out.some((o) => o.other)) out.push({ t: 'Mục khác:', other: true });
         }
         continue;
       }
-      if (x.t) out.push({ t: x.t, other: false });
+      if (x.t !== undefined && x.t !== '') out.push({ t: String(x.t), other: false });
     }
 
     const hasText = (t) => out.some((x) => !x.other && x.t.trim().toLowerCase() === String(t).trim().toLowerCase());
@@ -208,11 +193,10 @@
     return out;
   }
 
-  // Trích thang đo linear scale: [min, max, ...labels] (thử cả dạng lồng 1 cấp).
   function extractScale(entry) {
     try {
       const e4 = entry[4];
-      const cands = [e4 && e4[0], e4 && e4[0] && e4[0][0], e4 && e4[0] && e4[0][1]];
+      const cands = [e4 && e4[0] && e4[0][1], e4 && e4[0], e4 && e4[0] && e4[0][0]];
       for (const c of cands) {
         if (Array.isArray(c) && typeof c[0] === 'number' && typeof c[1] === 'number') {
           const [min, max] = [c[0], c[1]];
@@ -220,7 +204,6 @@
           for (let v = min; v <= max; v++) labels.push(String(v));
           return { min, max, options: labels.map((t) => ({ t, other: false })) };
         }
-        // Trường hợp Google Forms lưu scale dưới dạng danh sách các mảng ["1"], ["2"]...
         if (Array.isArray(c) && c.length >= 2 && Array.isArray(c[0]) && /^\d+$/.test(String(c[0][0]))) {
           const nums = c.map((item) => Number(item[0])).filter((n) => !Number.isNaN(n));
           if (nums.length >= 2) {
@@ -234,7 +217,6 @@
     return null;
   }
 
-  // Hàm chính: trả về mảng câu hỏi chuẩn hóa (bao gồm tất cả các trang)
   function extractFormStructure() {
     const raw = findLoadDataRaw();
     if (!raw) return { ok: false, error: 'Không tìm thấy FB_PUBLIC_LOAD_DATA_ trên trang này.', questions: [] };
@@ -247,7 +229,6 @@
     return parseStructureFromData(data);
   }
 
-  // Parse mảng FB đã JSON.parse thành danh sách câu hỏi xuyên suốt mọi trang.
   function parseStructureFromData(data) {
     try {
       const items = (data[1] && data[1][1]) || [];
@@ -261,28 +242,19 @@
         const typeId = entry[3];
         const type = TYPE_MAP[typeId] || ('UNKNOWN_' + typeId);
 
-        // Ngắt trang (Page Break / Section sang trang mới) -> tăng số trang
         if (type === 'PAGE_BREAK') {
           currentPage++;
           continue;
         }
-        // Bỏ qua khối tiêu đề/mô tả văn bản, hình ảnh, video trang trí
         if (type === 'SECTION' || type === 'IMAGE' || type === 'VIDEO') continue;
-        // Một số câu hỏi thực tế có dữ liệu con nằm ở entry[4]; nếu không có entry[4] thì không phải câu hỏi nhập liệu
         if (!Array.isArray(entry[4]) || entry[4].length === 0) continue;
-
-        // Input field ID thực sự của câu hỏi thường nằm ở entry[4][0][0]
-        const inputId = (entry[4][0] && entry[4][0][0]) ? String(entry[4][0][0]) : String(qid);
-        const isRequired = Boolean(entry[4][0] && entry[4][0][2] === 1);
 
         const q = {
           id: String(qid),
-          inputId,
           title: String(title).trim(),
           typeId,
           type,
           page: currentPage,
-          required: isRequired,
           options: []
         };
 
@@ -298,27 +270,24 @@
             q.options = mergeWithDom(extractOptions(entry), q.title, type);
           }
         } else if (type === 'GRID') {
-          // Grid: trong FB_PUBLIC_LOAD_DATA_, mỗi dòng của Grid là 1 phần tử trong entry[4]
-          // entry[4][rowIndex][0] = rowId, entry[4][rowIndex][1] = danh sách cột, entry[4][rowIndex][3][0] = Tên dòng
-          try {
-            const firstRowCols = entry[4][0] && entry[4][0][1];
-            const cols = normalizeOptionList(firstRowCols).filter((x) => !x.other || x.t);
-            q.options = cols.length ? cols : extractOptions(entry).filter((x) => !x.other || x.t);
+          const colOpts = extractOptions(entry).filter((x) => !x.other && x.t !== '');
+          q.options = colOpts.length ? colOpts : mergeWithDom([], q.title, 'GRID');
 
-            const gridRows = [];
-            for (const rowEntry of entry[4]) {
-              if (Array.isArray(rowEntry) && Array.isArray(rowEntry[3]) && rowEntry[3][0]) {
-                gridRows.push(String(rowEntry[3][0]));
-              }
+          const gridRows = [];
+          for (const rowEntry of entry[4]) {
+            if (Array.isArray(rowEntry)) {
+              const rowLabel = Array.isArray(rowEntry[3]) ? rowEntry[3][0] : null;
+              if (rowLabel) gridRows.push(String(rowLabel).trim());
             }
-            if (gridRows.length === 0 && Array.isArray(entry[4][8])) {
-              entry[4][8].forEach((r) => {
-                const rName = Array.isArray(r) ? r[0] : r;
-                if (rName) gridRows.push(String(rName));
-              });
-            }
-            if (gridRows.length > 0) q.gridRows = gridRows;
-          } catch { /* bỏ qua */ }
+          }
+          if (gridRows.length === 0 && Array.isArray(entry[4][8])) {
+            entry[4][8].forEach((r) => {
+              const rName = Array.isArray(r) ? r[0] : r;
+              if (rName) gridRows.push(String(rName).trim());
+            });
+          }
+          q.gridRows = gridRows;
+          q.rowCount = gridRows.length || entry[4].length || 1;
         }
         questions.push(q);
       }
@@ -335,22 +304,38 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const norm = (s) => (s || '').trim().replace(/\s+/g, ' ');
 
-  // Chuẩn hóa tiêu đề trên DOM: xóa dấu '*' của câu hỏi bắt buộc ở cuối
+  function isElementHidden(el) {
+    if (!el) return true;
+    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return true;
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      if (cur.style && (cur.style.display === 'none' || cur.style.visibility === 'hidden')) {
+        return true;
+      }
+      if (typeof window !== 'undefined' && window.getComputedStyle) {
+        try {
+          const cs = window.getComputedStyle(cur);
+          if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return true;
+        } catch { /* bỏ qua */ }
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
   function cleanHeadingText(headingEl) {
     if (!headingEl) return '';
-    // Clone để xóa các span dấu * (aria-label="Câu hỏi bắt buộc") nếu có
     const clone = headingEl.cloneNode(true);
-    const reqSpans = clone.querySelectorAll('[aria-label*="bắt buộc" i], [aria-label*="required" i]');
+    const reqSpans = clone.querySelectorAll('.vnumgf, [aria-label*="bắt buộc" i], [aria-label*="required" i]');
     reqSpans.forEach((s) => s.remove());
     return norm(clone.textContent).replace(/\s*\*\s*$/, '');
   }
 
-  // Tìm "khối câu hỏi" trên DOM bằng cách so khớp tiêu đề hoặc data-params chứa ID.
   function findQuestionBlock(questionTitle, questionId) {
     const blocks = document.querySelectorAll('div[role="listitem"]');
-    // 1. Ưu tiên khớp theo questionId trong thuộc tính data-params (nếu có)
     if (questionId) {
       for (const b of blocks) {
+        if (isElementHidden(b)) continue;
         const dpEl = b.querySelector('[data-params]');
         if (dpEl) {
           const dp = dpEl.getAttribute('data-params') || '';
@@ -362,54 +347,113 @@
     const want = norm(questionTitle).replace(/\s*\*\s*$/, '');
     if (!want) return null;
 
-    // 2. Ưu tiên khớp chính xác 100% tiêu đề đã làm sạch dấu *
     for (const b of blocks) {
+      if (isElementHidden(b)) continue;
       const heading = b.querySelector('[role="heading"]');
       if (heading && cleanHeadingText(heading).toLowerCase() === want.toLowerCase()) return b;
     }
 
-    // 3. Dự phòng: khớp chứa (chỉ khi chuỗi đủ dài để tránh bắt nhầm câu ngắn)
     for (const b of blocks) {
+      if (isElementHidden(b)) continue;
       const heading = b.querySelector('[role="heading"]');
       if (!heading) continue;
       const hText = cleanHeadingText(heading).toLowerCase();
       const wText = want.toLowerCase();
-      if ((wText.length >= 4 && hText.includes(wText)) || (hText.length >= 4 && wText.includes(hText))) return b;
+      if (hText.includes(wText) || (hText.length >= 5 && wText.includes(hText))) return b;
     }
     return null;
   }
 
-  // Click phần tử theo cách "giống người": scroll vào view + click chuột thật
+  // Click chuẩn Google Forms (Closure Library / Wiz jsaction)
   function humanClick(el) {
-    el.scrollIntoView({ block: 'center', behavior: 'instant' });
-    el.click();
+    if (!el) return;
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    } catch {
+      try { el.scrollIntoView(); } catch { /* bỏ qua */ }
+    }
+    try { el.focus(); } catch { /* bỏ qua */ }
+
+    let clientX = 10, clientY = 10;
+    try {
+      const rect = el.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        clientX = Math.round(rect.left + rect.width / 2);
+        clientY = Math.round(rect.top + rect.height / 2);
+      }
+    } catch { /* bỏ qua */ }
+
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: typeof window !== 'undefined' ? window : null,
+      detail: 1,
+      screenX: clientX,
+      screenY: clientY,
+      clientX,
+      clientY,
+      button: 0,
+      buttons: 1
+    };
+
+    const dispatchFullSequence = (target) => {
+      if (!target) return;
+      try {
+        if (typeof PointerEvent === 'function') {
+          target.dispatchEvent(new PointerEvent('pointerover', opts));
+          target.dispatchEvent(new PointerEvent('pointerenter', opts));
+          target.dispatchEvent(new PointerEvent('pointerdown', opts));
+        }
+        target.dispatchEvent(new MouseEvent('mouseover', opts));
+        target.dispatchEvent(new MouseEvent('mouseenter', opts));
+        target.dispatchEvent(new MouseEvent('mousedown', opts));
+        if (typeof PointerEvent === 'function') {
+          target.dispatchEvent(new PointerEvent('pointerup', { ...opts, buttons: 0 }));
+        }
+        target.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }));
+        target.dispatchEvent(new MouseEvent('click', { ...opts, buttons: 0 }));
+      } catch {
+        try { target.click(); } catch { /* bỏ qua */ }
+      }
+    };
+
+    dispatchFullSequence(el);
   }
 
-  // Tìm phần tử khớp nhất trong danh sách theo 2 vòng:
-  // Vòng 1: Khớp chính xác 100% (===)
-  // Vòng 2: Khớp một phần (includes) - chỉ cho phép option chứa want, tắt nếu exactOnly = true (như SCALE)
   function matchBestElement(elements, getLabelFn, wantRaw, exactOnly = false) {
     const want = norm(String(wantRaw)).toLowerCase();
     if (!want) return null;
 
-    // Vòng 1: Khớp tuyệt đối
     for (const el of elements) {
       const v = norm(getLabelFn(el)).toLowerCase();
       if (v === want) return el;
     }
     if (exactOnly) return null;
 
-    // Vòng 2: Khớp bao hàm (chỉ xét nhãn v chứa want, không cho want chứa v để tránh "Nam" khớp vào "Việt Nam")
     for (const el of elements) {
       const v = norm(getLabelFn(el)).toLowerCase();
       if (v && v.includes(want)) return el;
     }
+    for (const el of elements) {
+      const v = norm(getLabelFn(el)).toLowerCase();
+      if (v && v.length >= 2 && want.includes(v)) return el;
+    }
     return null;
   }
 
-  // Chọn đáp án "Mục khác:" (data-value="__other_option__") rồi điền textbox hiện ra.
+  function pickLineIfMultiline(val) {
+    if (typeof val !== 'string') return String(val ?? '');
+    if (!val.includes('\n')) return val;
+    const lines = val.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (lines.length === 0) return '';
+    return lines[Math.floor(Math.random() * lines.length)];
+  }
+
   async function fillOther(block, text) {
-    const cands = block.querySelectorAll('div[role="radio"], div[role="checkbox"]');
+    const cands = [...block.querySelectorAll('div[role="radio"], div[role="checkbox"]')].filter(
+      (el) => el.getAttribute('aria-disabled') !== 'true' && !el.closest('[aria-hidden="true"]')
+    );
     let otherEl = null;
     for (const el of cands) {
       const v = el.getAttribute('data-value') || '';
@@ -422,19 +466,20 @@
     if (!otherEl) return false;
     if (otherEl.getAttribute('aria-checked') !== 'true') {
       humanClick(otherEl);
-      await sleep(200); // Chờ Google Forms mở khóa ô input của "Mục khác"
+      await sleep(200);
     }
-    const box = block.querySelector('input[type="text"], textarea, input:not([type])');
+    const box = block.querySelector('input[type="text"], textarea, input:not([type]):not([type="hidden"])');
     if (!box) return true;
-    return fillTextInput(box, text);
+    return fillTextInput(box, pickLineIfMultiline(text));
   }
 
-  // Điền RADIO: Google Forms dùng div[role="radio"][data-value="..."]
   async function fillRadio(block, answer, exactOnly = false) {
     if (answer && typeof answer === 'object' && answer.other) {
       return await fillOther(block, answer.text || '');
     }
-    const radios = [...block.querySelectorAll('div[role="radio"]')];
+    const radios = [...block.querySelectorAll('div[role="radio"]')].filter(
+      (r) => r.getAttribute('aria-disabled') !== 'true' && !r.closest('[aria-hidden="true"]')
+    );
     const target = matchBestElement(
       radios,
       (r) => r.getAttribute('data-value') || r.getAttribute('aria-label') || r.textContent,
@@ -448,11 +493,12 @@
     return false;
   }
 
-  // Điền CHECKBOX: answer là mảng (nhiều lựa chọn), phần tử có thể là {other:true, text}
   async function fillCheckbox(block, answers) {
     const list = Array.isArray(answers) ? answers : [answers];
     let ok = 0;
-    const boxes = [...block.querySelectorAll('div[role="checkbox"]')];
+    const boxes = [...block.querySelectorAll('div[role="checkbox"]')].filter(
+      (c) => c.getAttribute('aria-disabled') !== 'true' && !c.closest('[aria-hidden="true"]')
+    );
     for (const wantRaw of list) {
       if (wantRaw && typeof wantRaw === 'object' && wantRaw.other) {
         if (await fillOther(block, wantRaw.text || '')) ok++;
@@ -468,7 +514,7 @@
         const checked = target.getAttribute('aria-checked') === 'true';
         if (!checked) {
           humanClick(target);
-          await sleep(100);
+          await sleep(80);
         }
         ok++;
       }
@@ -476,16 +522,14 @@
     return ok > 0;
   }
 
-  // Điền DROPDOWN: click listbox để mở, rồi click option
   async function fillDropdown(block, answer) {
     const want = norm(answer && typeof answer === 'object' ? (answer.text || '') : answer);
     const listbox = block.querySelector('div[role="listbox"]');
     if (!listbox) return false;
     humanClick(listbox);
     await sleep(550);
-    // Chỉ lấy các option đang hiển thị trong popup menu của dropdown
     const opts = [...document.querySelectorAll('div[role="option"]')].filter(
-      (o) => o.offsetParent !== null && o.getAttribute('data-value') !== ''
+      (o) => !isElementHidden(o) && o.getAttribute('data-value') !== ''
     );
     const target = matchBestElement(
       opts,
@@ -502,15 +546,108 @@
     return false;
   }
 
-  // Điền SCALE: bắt buộc khớp chính xác (exactOnly = true) để "1" không nhầm vào "10"
   async function fillScale(block, answer) {
     const val = answer && typeof answer === 'object' ? String(answer.text || '') : String(answer);
     return await fillRadio(block, val, true);
   }
 
-  // Điền giá trị vào 1 ô input/textarea cụ thể (dùng native setter cho framework Google)
+  function detectAttentionCheckAnswer(rowLabel, availableValues) {
+    if (!rowLabel) return null;
+    const m = rowLabel.match(/(?:vui\s+lòng|hãy|xin\s+hãy|bắt\s+buộc)?\s*(?:chọn|tích\s+vào|đánh\s+dấu)\s+(?:vào\s+)?(?:số|mức|đáp\s+án|ô|cột|mục)?\s*["'“”]?(\d+)["'“”]?/i);
+    if (m && m[1]) {
+      const trappedVal = m[1].trim();
+      if (!availableValues || availableValues.length === 0 || availableValues.includes(trappedVal)) {
+        return trappedVal;
+      }
+    }
+    return null;
+  }
+
+  async function fillGrid(block, answer) {
+    const rows = [...block.querySelectorAll('div[role="radiogroup"], div[role="group"]')].filter(
+      (rg) => rg.getAttribute('aria-hidden') !== 'true' && !rg.closest('[aria-hidden="true"]')
+    );
+    if (rows.length === 0) {
+      return await fillRadio(block, Array.isArray(answer) ? answer[0] : answer);
+    }
+
+    let okCount = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const rg = rows[i];
+      const rowLabel = norm(rg.getAttribute('aria-label') || '');
+
+      const rowRadios = [...rg.querySelectorAll('div[role="radio"]')].filter(
+        (r) => r.getAttribute('aria-disabled') !== 'true'
+      );
+      const rowCheckboxes = [...rg.querySelectorAll('div[role="checkbox"]')].filter(
+        (c) => c.getAttribute('aria-disabled') !== 'true'
+      );
+      const availableVals = rowRadios.map((r) => norm(r.getAttribute('data-value') || ''));
+
+      let rowTargetVal = null;
+
+      if (Array.isArray(answer) && answer.length > 0) {
+        rowTargetVal = answer[i % answer.length];
+      } else if (answer && typeof answer === 'object' && !answer.other) {
+        if (Array.isArray(answer.__rowAnswers) && answer.__rowAnswers.length > 0) {
+          rowTargetVal = answer.__rowAnswers[i % answer.__rowAnswers.length];
+        } else {
+          for (const [k, v] of Object.entries(answer)) {
+            const wantRow = norm(k).toLowerCase();
+            if (rowLabel.toLowerCase() === wantRow || (wantRow && rowLabel.toLowerCase().includes(wantRow))) {
+              rowTargetVal = v;
+              break;
+            }
+          }
+        }
+      } else {
+        rowTargetVal = answer;
+      }
+
+      const trapVal = detectAttentionCheckAnswer(rowLabel, availableVals);
+      if (trapVal !== null) {
+        rowTargetVal = trapVal;
+      }
+
+      if (rowTargetVal === null || rowTargetVal === undefined || rowTargetVal === '') {
+        if (availableVals.length > 0) {
+          rowTargetVal = availableVals[Math.floor(Math.random() * availableVals.length)];
+        }
+      }
+
+      let rowFilled = false;
+      if (rowCheckboxes.length > 0) {
+        rowFilled = await fillCheckbox(rg, rowTargetVal);
+      } else if (rowRadios.length > 0) {
+        const isNumericVal = /^\d+$/.test(norm(String(rowTargetVal)));
+        const targetRadio = matchBestElement(
+          rowRadios,
+          (r) => r.getAttribute('data-value') || r.getAttribute('aria-label') || r.textContent,
+          rowTargetVal,
+          isNumericVal
+        );
+        if (targetRadio) {
+          if (targetRadio.getAttribute('aria-checked') !== 'true') {
+            humanClick(targetRadio);
+          }
+          rowFilled = true;
+        }
+      }
+
+      if (rowFilled) {
+        okCount++;
+        await sleep(50 + Math.random() * 50);
+      }
+    }
+
+    return okCount === rows.length;
+  }
+
   function fillTextInput(field, value) {
-    field.scrollIntoView({ block: 'center', behavior: 'instant' });
+    try {
+      field.scrollIntoView({ block: 'center', behavior: 'instant' });
+    } catch { /* bỏ qua */ }
     field.focus();
     const proto = field.tagName === 'TEXTAREA'
       ? window.HTMLTextAreaElement.prototype
@@ -527,19 +664,16 @@
     return true;
   }
 
-  // Điền TEXT / PARAGRAPH
   function fillText(block, value) {
-    const field = block.querySelector('textarea, input[type="text"], input[type="email"], input[type="number"], input[type="tel"], input[type="url"], input:not([type])');
+    const field = block.querySelector('textarea, input[type="text"], input[type="email"], input[type="number"], input[type="tel"], input[type="url"], input:not([type]):not([type="hidden"])');
     if (!field) return false;
-    return fillTextInput(field, value);
+    return fillTextInput(field, pickLineIfMultiline(value));
   }
 
-  // Điền DATE: hỗ trợ cả 1 ô input[type="date"] hoặc 3 ô tách rời (Ngày / Tháng / Năm)
   function fillDate(block, value) {
-    const raw = String(value || '').trim();
+    const raw = pickLineIfMultiline(value).trim();
     if (!raw) return false;
 
-    // Chuẩn hóa chuỗi ngày về { yyyy, mm, dd }
     let yyyy = '2000', mm = '01', dd = '01';
     if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}$/.test(raw)) { const parts = raw.split(/[-/]/); yyyy = parts[0]; mm = parts[1].padStart(2, '0'); dd = parts[2].padStart(2, '0'); } else if (/^\d{1,2}[-/]\d{1,2}[-/]\d{4}$/.test(raw)) {
       const parts = raw.split(/[-/]/);
@@ -553,20 +687,13 @@
       return fillTextInput(dateInput, `${yyyy}-${mm}-${dd}`);
     }
 
-    const inputs = [...block.querySelectorAll('input[type="text"], input[type="number"], input:not([type])')];
+    const inputs = [...block.querySelectorAll('input[type="text"], input[type="number"], input:not([type]):not([type="hidden"])')];
     if (inputs.length >= 3) {
-      let filledLabels = 0;
       for (const inp of inputs) {
-        const lbl = stripVi(inp.getAttribute('aria-label') || inp.getAttribute('placeholder') || '').toLowerCase();
-        if (lbl.includes('ngay') || lbl.includes('day')) { fillTextInput(inp, dd); filledLabels++; }
-        else if (lbl.includes('thang') || lbl.includes('month')) { fillTextInput(inp, mm); filledLabels++; }
-        else if (lbl.includes('nam') || lbl.includes('year')) { fillTextInput(inp, yyyy); filledLabels++; }
-      }
-      if (filledLabels === 0) {
-        // Fallback theo thứ tự thông thường (Ngày / Tháng / Năm)
-        fillTextInput(inputs[0], dd);
-        fillTextInput(inputs[1], mm);
-        fillTextInput(inputs[2], yyyy);
+        const lbl = stripVi(inp.getAttribute('aria-label') || '').toLowerCase();
+        if (lbl.includes('ngay') || lbl.includes('day')) fillTextInput(inp, dd);
+        else if (lbl.includes('thang') || lbl.includes('month')) fillTextInput(inp, mm);
+        else if (lbl.includes('nam') || lbl.includes('year')) fillTextInput(inp, yyyy);
       }
       return true;
     }
@@ -576,9 +703,8 @@
     return false;
   }
 
-  // Điền TIME: hỗ trợ cả 1 ô input[type="time"] hoặc 2 ô tách rời (Giờ / Phút)
   function fillTime(block, value) {
-    const raw = String(value || '').trim();
+    const raw = pickLineIfMultiline(value).trim();
     if (!raw) return false;
     const match = raw.match(/(\d{1,2})[:h](\d{1,2})/);
     const hh = match ? match[1].padStart(2, '0') : '08';
@@ -589,7 +715,7 @@
       return fillTextInput(timeInput, `${hh}:${min}`);
     }
 
-    const inputs = [...block.querySelectorAll('input[type="text"], input[type="number"], input:not([type])')];
+    const inputs = [...block.querySelectorAll('input[type="text"], input[type="number"], input:not([type]):not([type="hidden"])')];
     if (inputs.length >= 2) {
       let filledAny = false;
       for (const inp of inputs) {
@@ -609,10 +735,17 @@
     return false;
   }
 
-  // Điền 1 câu hỏi theo payload { questionId, title, type, answer }
   async function fillOne(item) {
     const block = findQuestionBlock(item.title, item.questionId);
     if (!block) return { ok: false, reason: 'Không tìm thấy khối DOM cho: ' + item.title };
+
+    const activeRadioGroups = [...block.querySelectorAll('div[role="radiogroup"], div[role="group"]')].filter(
+      (rg) => rg.getAttribute('aria-hidden') !== 'true' && !rg.closest('[aria-hidden="true"]')
+    );
+    if (item.type === 'GRID' || activeRadioGroups.length > 1) {
+      return { ok: await fillGrid(block, item.answer) };
+    }
+
     switch (item.type) {
       case 'RADIO': return { ok: await fillRadio(block, item.answer) };
       case 'CHECKBOX': return { ok: await fillCheckbox(block, item.answer) };
@@ -623,35 +756,12 @@
       case 'TEXT':
       case 'PARAGRAPH':
         return { ok: fillText(block, item.answer) };
-      case 'GRID': {
-        if (typeof item.answer === 'object' && item.answer !== null) {
-          let okCount = 0;
-          const rows = block.querySelectorAll('div[role="radiogroup"], div[role="group"]');
-          for (const rg of rows) {
-            const rowLabel = norm(rg.getAttribute('aria-label') || '').toLowerCase();
-            for (const [rowName, colVal] of Object.entries(item.answer)) {
-              const wantRow = norm(rowName).toLowerCase();
-              if (rowLabel === wantRow || (wantRow && rowLabel.includes(wantRow))) {
-                const container = rg.parentElement || rg;
-                if (Array.isArray(colVal)) {
-                  if (await fillCheckbox(container, colVal)) okCount++;
-                } else {
-                  if (await fillRadio(container, colVal)) okCount++;
-                }
-              }
-            }
-          }
-          return { ok: okCount > 0 };
-        }
-        return { ok: await fillRadio(block, item.answer) };
-      }
       default:
         if (fillText(block, item.answer)) return { ok: true };
         return { ok: await fillRadio(block, item.answer) };
     }
   }
 
-  // Bỏ dấu tiếng Việt để so khớp bền vững
   function stripVi(s) {
     return (s || '').normalize('NFD')
       .replace(/[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g, '')
@@ -659,7 +769,7 @@
   }
 
   const SUBMIT_KEYS = ['gui', 'goi', 'submit', 'send', 'hoan tat', 'hoan thanh', 'xac nhan', 'done'];
-  const NEXT_KEYS = ['tiep', 'next', 'continue'];
+  const NEXT_KEYS = ['tiep', 'next', 'continue', 'ke tiep'];
   const BACK_KEYS = ['quay lai', 'tro lai', 'quay ve', 'truoc', 'back', 'previous'];
   const CLEAR_KEYS = ['xoa', 'clear'];
 
@@ -673,115 +783,173 @@
   const isBackBtn = (t) => BACK_KEYS.some((k) => t.includes(k));
   const hitKeys = (t, keys) => keys.some((k) => t === k || t.includes(k));
 
-  // Tìm nút Tiếp/Next hoặc Gửi/Submit ĐANG HIỂN THỊ ở cuối trang hiện tại.
+  // Nhận diện chính xác nút "Tiếp" (Next) và "Gửi" (Submit) của Google Forms
   function findNavButton() {
+    // 1. Ưu tiên nhận diện theo thuộc tính jsname chuẩn của Google Forms:
+    // - jsname="OCpkoe": Nút Tiếp (Next)
+    // - jsname="M2UYVd": Nút Gửi (Submit)
+    const jsNext = document.querySelector('div[role="button"][jsname="OCpkoe"], span[role="button"][jsname="OCpkoe"]');
+    if (jsNext && !isElementHidden(jsNext)) {
+      return { el: jsNext, kind: 'next' };
+    }
+    const jsSubmit = document.querySelector('div[role="button"][jsname="M2UYVd"], span[role="button"][jsname="M2UYVd"]');
+    if (jsSubmit && !isElementHidden(jsSubmit)) {
+      return { el: jsSubmit, kind: 'submit' };
+    }
+
+    // 2. Quét tất cả các nút điều hướng hiển thị trên trang
     const btns = [...document.querySelectorAll(
       'div[role="button"], span[role="button"], button, input[type="submit"], input[type="button"]'
     )];
-    // Lọc bỏ các nút đang bị ẩn (offsetParent === null) nếu chạy trên trình duyệt thật
-    const visibleBtns = btns.filter((b) => {
-      if (typeof window !== 'undefined' && typeof b.offsetParent !== 'undefined') {
-        // Trong môi trường JSDOM/Node test, offsetParent luôn là null nên cho qua nếu innerWidth === 0
-        if (window.innerWidth > 0 && b.offsetParent === null) return false;
-      }
-      return true;
-    });
-
+    const visibleBtns = btns.filter((b) => !isElementHidden(b));
     const items = visibleBtns.map((b) => ({ el: b, t: navText(b) })).filter((x) => x.t !== '');
     const usable = items.filter((x) => !isClearBtn(x.t) && !isBackBtn(x.t));
 
-    // Nếu trang có nút "Tiếp / Next", ưu tiên đi tiếp trước khi bấm Submit
     const n = usable.find((x) => hitKeys(x.t, NEXT_KEYS));
     if (n) return { el: n.el, kind: 'next' };
+
     const s = usable.find((x) => hitKeys(x.t, SUBMIT_KEYS));
     if (s) return { el: s.el, kind: 'submit' };
 
-    if (usable.length) {
-      const last = usable[usable.length - 1];
-      return { el: last.el, kind: hitKeys(last.t, NEXT_KEYS) ? 'next' : (hitKeys(last.t, SUBMIT_KEYS) ? 'submit' : 'next') };
-    }
     return null;
   }
 
   function seenButtons() {
     try {
       const list = [...document.querySelectorAll('div[role="button"], span[role="button"], button')]
+        .filter((b) => !isElementHidden(b))
         .map((b) => norm(b.textContent || (b.getAttribute && b.getAttribute('aria-label')) || b.value))
         .filter(Boolean).slice(0, 12);
       return list.length ? list.join(' | ') : '(không thấy nút nào trên trang)';
     } catch { return '(không đọc được DOM)'; }
   }
 
-  // Luồng fill chính: điền từng câu trên trang hiện tại -> bấm Tiếp sang trang sau -> bấm Gửi ở trang cuối
-  async function runFill(payloadItems, runId) {
-    const maxPages = 25;
-    let page = 0;
-    const remaining = [...payloadItems];
-    const errors = [];
-    let filled = 0;
+  /**
+   * FIX QUAN TRỌNG: Kiểm tra trang cảm ơn (Thank You page) sau khi Submit.
+   * TUYỆT ĐỐI KHÔNG trả về true nếu trên trang vẫn còn câu hỏi hoặc nút Tiếp/Gửi!
+   * (Tránh nhầm với chữ "Cảm ơn" trong mô tả form hoặc câu "Tên và ảnh sẽ được ghi lại...")
+   */
+  function isThankYouPage() {
+    try {
+      // 1. Nếu vẫn còn bất kỳ khối câu hỏi hiển thị nào hoặc vẫn còn nút Next/Submit -> CHẮC CHẮN CHƯA PHẢI trang cảm ơn!
+      const visibleQuestions = [...document.querySelectorAll('div[role="listitem"]')]
+        .filter((b) => !isElementHidden(b));
+      if (visibleQuestions.length > 0) return false;
 
+      const nav = findNavButton();
+      if (nav) return false;
+
+      // 2. Kiểm tra các dấu hiệu DOM đặc trưng của trang xác nhận đã gửi (Confirmation Page) của Google Forms
+      const hasConfirmClass = !!document.querySelector('.vHW8K, .freebirdFormviewerViewResponseConfirmationMessage, .freebirdFormviewerViewResponseLinksContainer');
+      const hasAnotherResponseLink = !!document.querySelector('a[href*="viewform"]');
+      if (hasConfirmClass || hasAnotherResponseLink) {
+        return true;
+      }
+
+      // 3. Kiểm tra cụm từ xác nhận cụ thể (chỉ khi KHÔNG còn câu hỏi và KHÔNG còn nút Tiếp/Gửi)
+      const bt = norm(document.body && document.body.innerText);
+      if (/phản hồi của bạn đã được ghi lại|câu trả lời của bạn đã được ghi lại|your response has been recorded|gửi phản hồi khác|submit another response/i.test(bt)) {
+        return true;
+      }
+    } catch { /* bỏ qua */ }
+    return false;
+  }
+
+  // Click nút Điều hướng (Tiếp / Gửi) đảm bảo ăn 100% trên Google Forms
+  async function clickNavButton(navEl) {
+    if (!navEl) return;
+    humanClick(navEl);
+    await sleep(80);
+    // Nếu Google Forms gắn listener sâu hơn hoặc cần click trực tiếp vào span bên trong
+    const innerSpan = navEl.querySelector('span');
+    if (innerSpan) {
+      try { innerSpan.click(); } catch { /* bỏ qua */ }
+    }
+  }
+
+  async function runFill(payloadItems, runId) {
     const heartbeat = () => {
       try { chrome.runtime.sendMessage({ type: 'FORM_HEARTBEAT', runId }); } catch { /* bỏ qua */ }
     };
 
+    // Chờ DOM của Google Forms render xong câu hỏi hoặc trang cảm ơn (tối đa ~4 giây)
+    for (let waitDom = 0; waitDom < 10; waitDom++) {
+      const hasQuestions = document.querySelectorAll('div[role="listitem"]').length > 0;
+      const nav = findNavButton();
+      if (hasQuestions || nav || isThankYouPage()) break;
+      await sleep(400);
+    }
+
+    if (isThankYouPage()) {
+      return { status: 'DONE' };
+    }
+
+    const maxPages = 25;
+    let page = 0;
+    const errors = [];
+
     while (page < maxPages) {
-      await sleep(800); // chờ trang hiện tại render đầy đủ
+      await sleep(500);
       heartbeat();
 
-      let filledOnThisPage = 0;
+      if (isThankYouPage()) {
+        return { status: 'DONE' };
+      }
+
       const failedVisibleOnThisPage = [];
 
-      // Điền mọi câu hỏi đang HIỂN THỊ trên trang hiện tại
-      for (let i = remaining.length - 1; i >= 0; i--) {
-        const item = remaining[i];
+      // Quét toàn bộ payloadItems cho những câu hỏi ĐANG HIỂN THỊ trên trang hiện tại
+      for (let i = 0; i < payloadItems.length; i++) {
+        const item = payloadItems[i];
         const block = findQuestionBlock(item.title, item.questionId);
-        if (!block) continue; // câu hỏi nằm ở trang sau hoặc nhánh khác
-        if (window.innerWidth > 0 && block.offsetParent === null) continue; // khối đang bị ẩn
+        if (!block) continue;
 
+        heartbeat();
         const res = await fillOne(item);
-        await sleep(150 + Math.random() * 250);
-        if (res.ok) {
-          remaining.splice(i, 1);
-          filled++;
-          filledOnThisPage++;
-          if (filled % 8 === 0) heartbeat();
-        } else {
+        heartbeat();
+        await sleep(150 + Math.random() * 150);
+
+        if (!res.ok) {
           const errMsg = item.title + ': ' + (res.reason || 'không điền được');
           errors.push(errMsg);
           failedVisibleOnThisPage.push(item.title);
         }
       }
 
-      // Kiểm tra xem Google Forms có đang báo lỗi đỏ (role="alert") trên câu bắt buộc nào không
+      await sleep(300);
       const nav = findNavButton();
-      if (!nav) break;
+      if (!nav) {
+        if (isThankYouPage()) return { status: 'DONE' };
+        break;
+      }
 
       if (nav.kind === 'submit') {
-        // Nếu vẫn còn câu hỏi ĐANG HIỂN THỊ trên trang cuối mà điền thất bại -> báo lỗi
         if (failedVisibleOnThisPage.length > 0) {
           return {
-            ok: false,
+            status: 'ERROR',
             error: 'Không điền được câu hỏi trên trang cuối: ' + failedVisibleOnThisPage.join('; ')
           };
         }
-        // Lưu ý: Nếu remaining.length > 0 nhưng KHÔNG hiển thị trên trang cuối,
-        // nghĩa là các câu đó thuộc nhánh rẽ (Conditional Branching) bị bỏ qua -> vẫn cho phép Submit!
-        humanClick(nav.el);
-        try { chrome.runtime.sendMessage({ type: 'FORM_SUBMITTED', runId }); } catch { /* bỏ qua */ }
 
-        for (let k = 0; k < 10; k++) {
-          await sleep(1000);
-          try {
-            const bt = norm(document.body && document.body.innerText);
-            if (/đã ghi lại|đã gửi|response.*recorded|thank you|cảm ơn|your response has been recorded|đã được ghi|gửi phản hồi khác|submit another response/i.test(bt)) {
-              return { ok: true };
+        // Báo cho background biết sắp bấm Submit
+        try { chrome.runtime.sendMessage({ type: 'FORM_SUBMITTED', runId }); } catch { /* bỏ qua */ }
+        await sleep(150);
+        await clickNavButton(nav.el);
+
+        // Chờ trang chuyển sang trang Cảm ơn (nếu trang reload thì script mới sẽ kiểm tra isThankYouPage())
+        for (let k = 0; k < 15; k++) {
+          await sleep(800);
+          if (isThankYouPage()) {
+            return { status: 'DONE' };
+          }
+          // Nếu sau 3s nút Submit vẫn còn nguyên trên trang và không có lỗi alert -> thử click bồi thêm 1 lần
+          if (k === 3) {
+            const alertNow = [...document.querySelectorAll('[role="alert"]')].map((e) => norm(e.textContent)).filter(Boolean);
+            const stillSubmit = findNavButton();
+            if (alertNow.length === 0 && stillSubmit && stillSubmit.kind === 'submit') {
+              await clickNavButton(stillSubmit.el);
             }
-            // Nếu trang không còn bất kỳ listitem câu hỏi nào và URL chứa formResponse -> đã tới trang cảm ơn
-            const stillHasQuestions = document.querySelectorAll('div[role="listitem"]').length > 0;
-            if (!stillHasQuestions && /formResponse/i.test(location.href)) {
-              return { ok: true };
-            }
-          } catch { break; }
+          }
         }
 
         let pageErr = '';
@@ -790,30 +958,75 @@
             .map((e) => norm(e.textContent)).filter(Boolean).slice(0, 3).join(' | ');
         } catch { /* bỏ qua */ }
         return {
-          ok: false,
+          status: 'ERROR',
           error: 'Đã bấm Submit nhưng không qua được trang cảm ơn. ' +
                  (pageErr ? 'Trang báo lỗi: ' + pageErr + '. ' : '') +
                  'Các nút đang thấy: ' + seenButtons()
         };
       } else {
-        // Trang trung gian (Multi-page): bấm "Tiếp / Next" để tải trang tiếp theo
-        humanClick(nav.el);
+        // Bấm nút "Tiếp / Next" để qua trang tiếp theo
+        heartbeat();
+        try { chrome.runtime.sendMessage({ type: 'FORM_NEXT_PAGE', runId }); } catch { /* bỏ qua */ }
+
+        const prevSignature = [...document.querySelectorAll('div[role="listitem"] [role="heading"]')]
+          .filter((h) => !isElementHidden(h))
+          .map((h) => norm(h.textContent))
+          .join('||');
+
+        await clickNavButton(nav.el);
         page++;
-        await sleep(1200);
+
+        // Chờ trang mới tải (hỗ trợ cả chuyển trang không reload lẫn full page reload)
+        let pageChanged = false;
+        for (let w = 0; w < 12; w++) {
+          await sleep(450);
+          if (isThankYouPage()) return { status: 'DONE' };
+
+          const curSignature = [...document.querySelectorAll('div[role="listitem"] [role="heading"]')]
+            .filter((h) => !isElementHidden(h))
+            .map((h) => norm(h.textContent))
+            .join('||');
+
+          const curNav = findNavButton();
+          if (curSignature !== prevSignature || (curNav && curNav.kind === 'submit' && prevSignature === '')) {
+            pageChanged = true;
+            break;
+          }
+
+          // Nếu sau ~1.8s vẫn chưa chuyển trang và chưa báo lỗi alert, thử click lại nút Tiếp lần nữa
+          if (w === 4) {
+            const retryNav = findNavButton();
+            if (retryNav && retryNav.kind === 'next') {
+              await clickNavButton(retryNav.el);
+            }
+          }
+
+          const alertTexts = [...document.querySelectorAll('[role="alert"]')]
+            .map((e) => norm(e.textContent)).filter(Boolean);
+          if (w >= 6 && alertTexts.length > 0) {
+            return {
+              status: 'ERROR',
+              error: 'Không thể qua trang tiếp theo do báo lỗi trên form: ' + alertTexts.join(' | ')
+            };
+          }
+        }
+
+        if (!pageChanged) {
+          const alertTexts = [...document.querySelectorAll('[role="alert"]')]
+            .map((e) => norm(e.textContent)).filter(Boolean);
+          return {
+            status: 'ERROR',
+            error: 'Đã bấm nút Tiếp nhưng trang không chuyển sang trang mới. ' +
+                   (alertTexts.length ? 'Lỗi trên trang: ' + alertTexts.join(' | ') : 'Các nút đang thấy: ' + seenButtons())
+          };
+        }
       }
     }
 
-    if (remaining.length > 0) {
-      return {
-        ok: false,
-        error: 'Vượt quá số trang tối đa hoặc kẹt nút điều hướng, còn sót: ' +
-               remaining.map((r) => r.title).join('; ') + ' | Các nút đang thấy: ' + seenButtons()
-      };
-    }
     return {
-      ok: false,
-      error: 'Không tìm thấy nút Gửi/Submit. Các nút đang thấy: ' + seenButtons() +
-             (errors.length ? '. Chi tiết lỗi: ' + errors.join('; ') : '')
+      status: 'ERROR',
+      error: 'Không tìm thấy nút điều hướng hoặc bị kẹt trang. Các nút đang thấy: ' + seenButtons() +
+             (errors.length ? '. Chi tiết: ' + errors.join('; ') : '')
     };
   }
 
@@ -831,20 +1044,29 @@
       return true;
     }
     if (msg && msg.type === 'FILL_FORM') {
+      if (activeFillingRunId === msg.runId) {
+        sendResponse({ ack: true, alreadyRunning: true });
+        return true;
+      }
+      activeFillingRunId = msg.runId;
+
       (async () => {
         try {
           const res = await runFill(msg.payload || [], msg.runId);
-          chrome.runtime.sendMessage({
-            type: res.ok ? 'FORM_DONE' : 'FORM_ERROR',
-            runId: msg.runId,
-            error: res.error || null
-          });
+          if (res.status === 'DONE') {
+            chrome.runtime.sendMessage({ type: 'FORM_DONE', runId: msg.runId, error: null });
+          } else if (res.status === 'ERROR') {
+            chrome.runtime.sendMessage({ type: 'FORM_ERROR', runId: msg.runId, error: res.error || 'Lỗi không xác định' });
+          }
         } catch (e) {
-          chrome.runtime.sendMessage({
-            type: 'FORM_ERROR',
-            runId: msg.runId,
-            error: String((e && e.message) || e)
-          });
+          const errStr = String((e && e.message) || e);
+          if (!/context invalidated|unload/i.test(errStr)) {
+            try {
+              chrome.runtime.sendMessage({ type: 'FORM_ERROR', runId: msg.runId, error: errStr });
+            } catch { /* bỏ qua */ }
+          }
+        } finally {
+          activeFillingRunId = null;
         }
       })();
       sendResponse({ ack: true });
@@ -852,14 +1074,12 @@
     }
   });
 
-  // Hook cho kiểm thử Node
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       TYPE_MAP, OTHER_RE, OTHER_VALUE,
-      extractJsonArray, findLoadDataRaw, parseLoadData, parseStructureFromData,
+      parseLoadData, parseStructureFromData,
       normalizeOptionList, extractOptions, extractScale, mergeWithDom,
-      cleanHeadingText, matchBestElement,
-      stripVi, navText, findNavButton, seenButtons,
+      stripVi, navText, findNavButton, seenButtons, isThankYouPage
     };
   }
 })();

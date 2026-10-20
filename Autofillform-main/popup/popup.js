@@ -2,20 +2,17 @@
  * popup.js — Giao diện cấu hình + Tracking
  * - Xin cấu trúc form từ content.js (EXTRACT_REQUEST)
  * - Render TẤT CẢ câu hỏi + câu trả lời, mỗi câu trả lời có ô % riêng
- * - Tick "Dùng Gemini AI" CHỈ hiện với câu nhập liệu (TEXT/PARAGRAPH);
- *   khối Prompt ẨN cho tới khi tick vào
  * - Thuật toán Largest Remainder Method -> sinh mảng kịch bản (payloads)
  * - Gửi START_RUN cho background, theo dõi tiến độ (STATS_UPDATE)
  * ========================================================================== */
 'use strict';
 
-let QUESTIONS = [];   // [{id,title,type,typeId,options}]
+let QUESTIONS = [];   // [{id,title,type,typeId,options,page,required}]
 let FORM_URL = null;
+let TOTAL_PAGES = 1; // so trang (section) cua form
 
 // Loại chọn-1-đáp-án: dùng LRM để chia đúng tổng. Checkbox: % = xác suất độc lập.
 const SINGLE_CHOICE = new Set(['RADIO', 'DROPDOWN', 'SCALE', 'GRID']);
-// Loại ô nhập liệu: mới được hiện tickbox "Dùng Gemini AI"
-const TEXT_LIKE = new Set(['TEXT', 'PARAGRAPH']);
 
 /* ---------------- Khởi động: lấy form từ tab đang mở ---------------- */
 document.addEventListener('DOMContentLoaded', init);
@@ -58,7 +55,9 @@ async function init() {
     return;
   }
   QUESTIONS = res.questions || [];
-  document.getElementById('formTitle').textContent = res.formTitle || 'Google Forms';
+  TOTAL_PAGES = res.totalPages || 1;
+  document.getElementById('formTitle').textContent =
+    (res.formTitle || 'Google Forms') + (TOTAL_PAGES > 1 ? ` — ${TOTAL_PAGES} trang` : '');
   if (QUESTIONS.length === 0) {
     setLoad('⚠️ Form này không có câu hỏi nào nhận diện được.', true);
     return;
@@ -101,6 +100,23 @@ function renderQuestions() {
     badge.className = 'q-type';
     badge.textContent = 'Loại: ' + labelType(q);
     card.append(h, badge);
+
+    // Badge trang (section) + dau bat buoc
+    const meta = document.createElement('div');
+    meta.className = 'q-meta';
+    if (q.page && TOTAL_PAGES > 1) {
+      const pg = document.createElement('span');
+      pg.className = 'q-page';
+      pg.textContent = 'Trang ' + q.page + '/' + TOTAL_PAGES;
+      meta.appendChild(pg);
+    }
+    if (q.required) {
+      const rq = document.createElement('span');
+      rq.className = 'q-req';
+      rq.textContent = 'Bắt buộc';
+      meta.appendChild(rq);
+    }
+    if (meta.childNodes.length) card.appendChild(meta);
 
     // Trắc nghiệm / Checkbox: LIỆT KÊ SẴN toàn bộ đáp án, mỗi đáp án 1 ô %.
     // Các loại này KHÔNG có khung nhập đáp án và KHÔNG có nút thêm đáp án.
@@ -146,61 +162,30 @@ function renderQuestions() {
         });
       }
     } else {
-      // ---- Câu NHẬP LIỆU: liệt kê từng câu trả lời, mỗi câu 1 ô % riêng ----
+      // ---- Câu NHẬP LIỆU: 1 ô textarea, MỖI DÒNG là 1 đáp án ----
       const info = document.createElement('div');
       info.className = 'hint';
-      info.textContent = 'Mỗi câu trả lời có ô % riêng. Tổng tất cả % phải = 100% (xem dòng "Còn lại" ở dưới). Nút 🎲 chia ngẫu nhiên phần còn lại cho các ô còn trống. Hỗ trợ Spintax {A|B}.';
+      info.textContent = 'Nhập nhiều đáp án, MỖI DÒNG là 1 đáp án (dùng xuống dòng để tách). '
+        + 'Mỗi form sẽ chọn NGẪU NHIÊN 1 dòng để điền vào ô trả lời. Hỗ trợ Spintax {A|B}.';
       card.appendChild(info);
 
-      // Tickbox AI CHỈ hiện với ô nhập liệu TEXT/PARAGRAPH (không hiện cho trắc nghiệm, ngày, giờ…)
-      if (TEXT_LIKE.has(q.type)) {
-        const aiRow = document.createElement('label');
-        aiRow.className = 'ai-row';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox'; cb.className = 'use-ai';
-        aiRow.append(cb, document.createTextNode(' Dùng Gemini AI'));
-        card.appendChild(aiRow);
+      const ta = document.createElement('textarea');
+      ta.className = 'text-answers';
+      ta.rows = 4;
+      ta.placeholder = 'Dap an so 1\nDap an so 2\nDap an so 3';
+      card.appendChild(ta);
 
-        // Khối Prompt ẨN mặc định — chỉ hiện khi tick "Dùng Gemini AI"
-        const promptWrap = document.createElement('div');
-        promptWrap.className = 'prompt-wrap';
-        promptWrap.hidden = true;
-        const plb = document.createElement('div');
-        plb.className = 'hint';
-        plb.textContent = 'Custom Prompt (hỗ trợ Spintax {A|B} và biến {{question}}):';
-        const prompt = document.createElement('textarea');
-        prompt.className = 'ai-prompt';
-        prompt.placeholder = 'VD: {Vui vẻ|Hào hứng} trả lời ngắn gọn: {{question}} (dưới 20 từ)';
-        prompt.value = 'Trả lời ngắn gọn, tự nhiên (dưới 20 từ) cho câu hỏi: {{question}}';
-        const aiPctRow = document.createElement('div');
-        aiPctRow.className = 'opt-row';
-        const aiLb = document.createElement('span');
-        aiLb.textContent = '🤖 Tỉ lệ form dùng AI trả lời';
-        const aiPct = document.createElement('input');
-        aiPct.type = 'number'; aiPct.min = '0'; aiPct.max = '100'; aiPct.step = '1';
-        aiPct.value = ''; aiPct.className = 'ai-pct'; aiPct.title = '% số form do AI trả lời';
-        const pct = document.createElement('span');
-        pct.textContent = '%'; pct.className = 'pct-lb';
-        aiPctRow.append(aiLb, aiPct, pct);
-        promptWrap.append(plb, prompt, aiPctRow);
-        card.appendChild(promptWrap);
+      const cnt = document.createElement('div');
+      cnt.className = 'hint ans-count';
+      card.appendChild(cnt);
 
-        cb.addEventListener('change', () => { promptWrap.hidden = !cb.checked; refreshCard(card); });
-      }
+      const updateCount = () => {
+        const n = splitAnswers(ta.value).length;
+        cnt.textContent = n ? `Số đáp án trong danh sách: ${n}` : 'Chưa có đáp án nào.';
+      };
+      ta.addEventListener('input', updateCount);
+      updateCount();
 
-      // Danh sách các mẫu câu trả lời tĩnh (mỗi dòng = 1 text + 1 ô %)
-      const list = document.createElement('div');
-      list.className = 'variant-list';
-      card.appendChild(list);
-      addTextVariantRow(list, '', ''); // dòng mặc định để trống %
-      const addBtn = document.createElement('button');
-      addBtn.type = 'button';
-      addBtn.className = 'btn add-btn';
-      addBtn.textContent = '＋ Thêm câu trả lời';
-      addBtn.addEventListener('click', () => { addTextVariantRow(list, '', ''); refreshCard(card); });
-      card.appendChild(addBtn);
-      // Thanh "Còn lại: %" + nút chia ngẫu nhiên (đặt cuối card, sau khi đã có các dòng)
-      card.appendChild(remainderFooter(card, '.variant-pct, .ai-pct'));
     }
     wrap.appendChild(card);
   });
@@ -237,43 +222,37 @@ function choiceRow(opt, inputClass, defaultPct) {
   return row;
 }
 
-// Ô nhập nội dung điền vào textbox của đáp án "Mục khác:" (hỗ trợ Spintax)
+// Ô nhập nội dung điền vào textbox của đáp án "Mục khác:".
+// MỖI DÒNG là 1 nội dung khác nhau -> mỗi form chọn ngẫu nhiên 1 dòng.
 function otherTextInput() {
-  const row = document.createElement('div');
-  row.className = 'opt-row other-text-wrap';
-  const lb = document.createElement('span');
-  lb.textContent = 'Nội dung điền vào "Mục khác"';
+  const wrap = document.createElement('div');
+  wrap.className = 'other-text-wrap';
+  const lb = document.createElement('div');
+  lb.textContent = 'Nội dung điền vào "Mục khác" (mỗi dòng 1 nội dung, chọn random 1 dòng)';
   lb.className = 'hint';
-  const inp = document.createElement('input');
-  inp.type = 'text'; inp.className = 'other-text';
-  inp.placeholder = 'VD: {Ý kiến riêng|Đề xuất khác}';
-  row.append(lb, inp);
-  return row;
+  const inp = document.createElement('textarea');
+  inp.rows = 2;
+  inp.className = 'other-text';
+  inp.placeholder = 'Ý kiến riêng\nĐề xuất khác';
+  wrap.append(lb, inp);
+  return wrap;
 }
 
-// Thêm 1 dòng "câu trả lời + ô %" cho câu nhập liệu
-function addTextVariantRow(listEl, text, pct) {
-  const row = document.createElement('div');
-  row.className = 'opt-row variant-row';
-  const inp = document.createElement('input');
-  inp.type = 'text'; inp.className = 'variant-text';
-  inp.placeholder = 'Nhập 1 mẫu câu trả lời…';
-  inp.value = text;
-  const num = document.createElement('input');
-  num.type = 'number'; num.min = '0'; num.max = '100'; num.step = '1';
-  num.value = pct; num.className = 'variant-pct'; num.title = '% số form dùng câu này';
-  num.placeholder = '%';
-  const pctLb = document.createElement('span');
-  pctLb.textContent = '%'; pctLb.className = 'pct-lb';
-  const del = document.createElement('button');
-  del.type = 'button'; del.className = 'mini-btn'; del.textContent = '✕'; del.title = 'Xóa dòng này';
-  del.addEventListener('click', () => {
-    if (listEl.children.length > 1) row.remove();
-    else { inp.value = ''; num.value = ''; }
-    refreshCard(listEl.closest('.q-card'));
-  });
-  row.append(inp, num, pctLb, del);
-  listEl.appendChild(row);
+/* ---------- DANH SÁCH ĐÁP ÁN (textarea nhiều dòng) ---------- */
+
+// Tách chuỗi textarea thành danh sách đáp án: MỖI DÒNG = 1 đáp án.
+// Bỏ qua dòng trống và khoảng trắng thừa 2 đầu.
+function splitAnswers(raw) {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+}
+
+// Chọn NGẪU NHIÊN đúng 1 đáp án trong danh sách.
+function pickRandomAnswer(list) {
+  if (!Array.isArray(list) || list.length === 0) return '';
+  return list[Math.floor(Math.random() * list.length)];
 }
 
 /* ---------- Thanh "Còn lại: %" + nút 🎲 chia ngẫu nhiên ---------- */
@@ -423,7 +402,7 @@ function largestRemainder(percentList, total) {
   return bag; // mảng index của options, dài đúng = total
 }
 
-// Parse Spintax phía popup cho TEXT TĨNH (AI prompt parse ở background trước khi gọi API)
+// Parse Spintax phía popup cho đáp án tĩnh (chọn 1 nhánh ngẫu nhiên)
 function spinOnce(s) {
   return String(s).replace(/(?<!\{)\{([^{}]*)\}(?!\})/g, (_m, inner) => {
     const parts = String(inner).split('|');
@@ -438,7 +417,6 @@ async function onStart() {
   const total = parseInt(document.getElementById('inTotal').value, 10);
   const delayMin = parseFloat(document.getElementById('inDelayMin').value);
   const delayMax = parseFloat(document.getElementById('inDelayMax').value);
-  const apiKey = document.getElementById('inApiKey').value.trim();
 
   if (!FORM_URL) { errEl.textContent = 'Chưa xác định được URL form.'; return; }
   if (!total || total < 1 || total > 1000) { errEl.textContent = 'Tổng số form phải từ 1–1000.'; return; }
@@ -446,7 +424,7 @@ async function onStart() {
 
   // Đọc cấu hình từng câu hỏi từ DOM
   const cards = [...document.querySelectorAll('.q-card')];
-  const qConfigs = []; // [{q, kind:'single'|'checkbox'|'textmix', ...}]
+  const qConfigs = []; // [{q, kind:'single'|'checkbox'|'text', ...}]
   for (const card of cards) {
     const q = QUESTIONS.find((x) => x.id === card.dataset.qid);
     // Chặn sớm: trắc nghiệm/checkbox mà không có đáp án bóc sẵn thì không thể chạy
@@ -464,54 +442,33 @@ async function onStart() {
       }
       if (pcts.some((p) => p < 0 || p > 100)) { errEl.textContent = `Câu "${q.title}": % phải 0–100.`; return; }
       const otherFlags = inputs.map((i) => i.dataset.other === '1');
-      // Mẫu text điền vào "Mục khác:" — bắt buộc khi tỉ lệ Other > 0
-      const otherText = ((card.querySelector('.other-text') || {}).value || '');
+      // Danh sách nội dung cho "Mục khác:" (mỗi dòng 1 nội dung) — bắt buộc khi tỉ lệ Other > 0
+      const otherAnswers = splitAnswers(((card.querySelector('.other-text') || {}).value || ''));
       const otherIdx = otherFlags.findIndex(Boolean);
-      if (otherIdx !== -1 && pcts[otherIdx] > 0 && !otherText.trim()) {
-        errEl.textContent = `Câu "${q.title}": đáp án "Mục khác" có tỉ lệ > 0 — hãy nhập nội dung điền vào mục này.`;
+      if (otherIdx !== -1 && pcts[otherIdx] > 0 && otherAnswers.length === 0) {
+        errEl.textContent = `Câu "${q.title}": đáp án "Mục khác" có tỉ lệ > 0 — hãy nhập ít nhất 1 nội dung (mỗi dòng 1 nội dung).`;
         return;
       }
-      qConfigs.push({ q, kind: 'single', opts: inputs.map((i) => i.dataset.opt), pcts, otherFlags, otherText });
+      qConfigs.push({ q, kind: 'single', opts: inputs.map((i) => i.dataset.opt), pcts, otherFlags, otherAnswers });
     } else if (q.type === 'CHECKBOX') {
       const inputs = [...card.querySelectorAll('.prob-input')];
       const probs = inputs.map((i) => Math.min(100, Math.max(0, parseFloat(i.value) || 0)));
       const otherFlags = inputs.map((i) => i.dataset.other === '1');
-      const otherText = ((card.querySelector('.other-text') || {}).value || '');
+      const otherAnswers = splitAnswers(((card.querySelector('.other-text') || {}).value || ''));
       const otherIdx = otherFlags.findIndex(Boolean);
-      if (otherIdx !== -1 && probs[otherIdx] > 0 && !otherText.trim()) {
-        errEl.textContent = `Câu "${q.title}": đáp án "Mục khác" có tỉ lệ > 0 — hãy nhập nội dung điền vào mục này.`;
+      if (otherIdx !== -1 && probs[otherIdx] > 0 && otherAnswers.length === 0) {
+        errEl.textContent = `Câu "${q.title}": đáp án "Mục khác" có tỉ lệ > 0 — hãy nhập ít nhất 1 nội dung (mỗi dòng 1 nội dung).`;
         return;
       }
-      qConfigs.push({ q, kind: 'checkbox', opts: inputs.map((i) => i.dataset.opt), probs, otherFlags, otherText });
+      qConfigs.push({ q, kind: 'checkbox', opts: inputs.map((i) => i.dataset.opt), probs, otherFlags, otherAnswers });
     } else {
-      // ---- Câu nhập liệu: gom các biến thể (tĩnh + AI), mỗi biến thể có % riêng ----
-      const useAI = TEXT_LIKE.has(q.type) && card.querySelector('.use-ai').checked;
-      const items = []; // [{kind:'static', text, pct} | {kind:'ai', prompt, pct}]
-      const rows = [...card.querySelectorAll('.variant-row')];
-      for (const r of rows) {
-        const text = r.querySelector('.variant-text').value;
-        const pct = parseFloat(r.querySelector('.variant-pct').value) || 0;
-        if (text.trim() === '') {
-          if (pct > 0) { errEl.textContent = `Câu "${q.title}": có dòng % = ${pct} nhưng chưa nhập nội dung.`; return; }
-          continue; // bỏ qua dòng trống
-        }
-        if (pct < 0 || pct > 100) { errEl.textContent = `Câu "${q.title}": % phải 0–100.`; return; }
-        items.push({ kind: 'static', text, pct });
-      }
-      if (useAI) {
-        const prompt = card.querySelector('.ai-prompt').value.trim();
-        const aiPct = parseFloat(card.querySelector('.ai-pct').value) || 0;
-        if (!apiKey) { errEl.textContent = 'Bạn tick "Dùng AI" nhưng chưa nhập Gemini API Key.'; return; }
-        if (!prompt) { errEl.textContent = `Câu "${q.title}": nhập Custom Prompt cho AI.`; return; }
-        items.push({ kind: 'ai', prompt, pct: aiPct });
-      }
-      if (items.length === 0) { errEl.textContent = `Câu "${q.title}": nhập ít nhất 1 câu trả lời hoặc tick Dùng AI.`; return; }
-      const sum = items.reduce((a, b) => a + b.pct, 0);
-      if (Math.abs(sum - 100) > 0.001) {
-        errEl.textContent = `Câu "${q.title}": tổng % phải = 100 (hiện ${sum}).`;
+      // ---- Câu nhập liệu: 1 textarea nhiều dòng, mỗi dòng = 1 đáp án ----
+      const answers = splitAnswers(((card.querySelector('.text-answers') || {}).value || ''));
+      if (answers.length === 0) {
+        errEl.textContent = `Câu "${q.title}": hãy nhập ít nhất 1 đáp án (mỗi dòng 1 đáp án).`;
         return;
       }
-      qConfigs.push({ q, kind: 'textmix', items });
+      qConfigs.push({ q, kind: 'text', answers });
     }
   }
 
@@ -520,14 +477,6 @@ async function onStart() {
   for (const cfg of qConfigs) {
     if (cfg.kind === 'single') {
       singleBags.set(cfg.q.id, largestRemainder(cfg.pcts, total));
-    }
-  }
-  // …và cho các câu nhập liệu (biến thể tĩnh + AI chia % chung qua LRM)
-  const textBags = new Map(); // qid -> mảng biến thể dài = total
-  for (const cfg of qConfigs) {
-    if (cfg.kind === 'textmix') {
-      const idxBag = largestRemainder(cfg.items.map((it) => it.pct), total);
-      textBags.set(cfg.q.id, idxBag.map((idx) => cfg.items[idx]));
     }
   }
 
@@ -541,7 +490,7 @@ async function onStart() {
         const bag = singleBags.get(qid);
         // Đáp án Other -> gói {other:true, text} để content.js tick + điền textbox
         const toVal = (idx) => (cfg.otherFlags[idx]
-          ? { other: true, text: spinOnce(cfg.otherText || '') }
+          ? { other: true, text: spinOnce(pickRandomAnswer(cfg.otherAnswers)) }
           : cfg.opts[idx]);
         if (cfg.q.type === 'GRID') {
           // Grid: mỗi dòng nhận 1 cột theo phân bổ (random dòng để đa dạng).
@@ -567,28 +516,32 @@ async function onStart() {
         one[qid] = {
           kind: 'choice',
           value: pickedIdx.map((i) => (cfg.otherFlags[i]
-            ? { other: true, text: spinOnce(cfg.otherText || '') }
+            ? { other: true, text: spinOnce(pickRandomAnswer(cfg.otherAnswers)) }
             : cfg.opts[i])),
         };
-      } else if (cfg.kind === 'textmix') {
-        const item = textBags.get(qid)[f];
-        if (item.kind === 'ai') {
-          one[qid] = { kind: 'ai', prompt: item.prompt, questionTitle: cfg.q.title };
-        } else {
-          one[qid] = { kind: 'static', value: spinOnce(item.text) };
-        }
+      } else if (cfg.kind === 'text') {
+        // Chọn NGẪU NHIÊN đúng 1 đáp án trong danh sách (mỗi dòng 1 đáp án)
+        one[qid] = { kind: 'static', value: spinOnce(pickRandomAnswer(cfg.answers)) };
       }
     }
     payloads.push(one);
   }
 
   const questionsMeta = {};
-  QUESTIONS.forEach((q) => { questionsMeta[q.id] = { title: q.title, type: q.type }; });
+  QUESTIONS.forEach((q) => {
+    questionsMeta[q.id] = {
+      title: q.title,
+      type: q.type,
+      page: q.page || 1,
+      required: !!q.required,
+      inputId: q.inputId || '',
+    };
+  });
 
   // Gửi cho background chạy queue
   const resp = await chrome.runtime.sendMessage({
     type: 'START_RUN',
-    formUrl: FORM_URL, payloads, questionsMeta, delayMin, delayMax, apiKey,
+    formUrl: FORM_URL, payloads, questionsMeta, delayMin, delayMax,
   });
   if (!resp?.ok) { errEl.textContent = resp?.error || 'Không khởi động được.'; return; }
   showTracking();
@@ -607,6 +560,8 @@ function renderStats(s) {
   document.getElementById('stSuccess').textContent = s.success ?? 0;
   document.getElementById('stFailed').textContent = s.failed ?? 0;
   document.getElementById('stActive').textContent = s.active ?? 0;
+  const skEl = document.getElementById('stSkipped');
+  if (skEl) skEl.textContent = s.skippedCount ?? 0;
   const done = (s.success || 0) + (s.failed || 0);
   const pct = s.total ? Math.round((done / s.total) * 100) : 0;
   document.getElementById('progressFill').style.width = pct + '%';

@@ -1,42 +1,37 @@
 /* ============================================================================
  * background.js — Service Worker (BỘ NÃO)
- * - Queue Manager: tối đa 10 tab ẩn cùng lúc (có khóa chống Race Condition)
- * - Resolve AI (Gemini 3.8 Flash) + Spintax cho câu hỏi text
- * - Hỗ trợ Multi-page Google Forms (không đóng nhầm tab khi qua trang mới)
- * - Fail-safe 1: timeout 30s / tab  |  Fail-safe 2: API lỗi 3 lần liên tiếp
- * - Delay ngẫu nhiên Min–Max (giây) giữa các lượt submit
+ * - Queue Manager: tối đa 10 tab ẩn cùng lúc (chống Race Condition)
+ * - Hỗ trợ Multi-page Google Forms: Khi bấm "Tiếp" hoặc "Submit" làm trang
+ *   reload sang URL .../formResponse, background gửi lại payload để content.js
+ *   điền tiếp trang 2, 3... hoặc xác nhận chính xác trang Cảm Ơn trước khi đóng tab.
  * ========================================================================== */
 
-// --- Hằng số cấu hình ---
-const MAX_CONCURRENT_TABS = 10;   // giới hạn đa nhiệm
-const TAB_TIMEOUT_MS = 30 * 1000; // Fail-safe 1: 30 giây / tab không có heartbeat
-const API_MAX_STRIKE = 3;         // Fail-safe 2: 3 lỗi liên tiếp -> dừng hệ thống
-const GEMINI_MODEL = 'gemini-3.8-flash';
-const GEMINI_TIMEOUT_MS = 25 * 1000;
+const MAX_CONCURRENT_TABS = 10;
+const TAB_TIMEOUT_MS = 35 * 1000;
+const DEFAULT_GRID_ROWS = 40;
 
-// --- State toàn cục của 1 phiên chạy ---
 const state = {
   isRunning: false,
-  isPumping: false,       // Mutex chống chạy chồng chéo hàm pump()
-  resolvingCount: 0,      // Số lượng form đang gọi AI (giữ chỗ trước khi mở tab)
-  nextIndex: 0,           // Bộ đếm thứ tự form độc lập (không bị trùng khi chạy song song)
+  isPumping: false,
+  nextIndex: 0,
   runId: null,
   formUrl: null,
-  queue: [],              // mảng payload thô chờ xử lý (mỗi phần tử = 1 form)
-  questionsMeta: {},      // { qid: {title, type} }
+  queue: [],
+  questionsMeta: {},
+  gridBasePools: new Map(),
+  gridRowDecks: new Map(),
+  textLineDecks: new Map(),
   activeTabs: new Map(),  // tabId -> { timeoutId, index, submitted }
-  pendingSend: new Map(), // tabId -> { payload, runId, index }
+  tabJobs: new Map(),     // tabId -> { payload, runId, index }
   stats: { total: 0, success: 0, failed: 0 },
-  errorLog: [],           // nhật ký lỗi chi tiết [{index, error, time}]
-  apiErrorCount: 0,
-  delayMin: 3,            // GIÂY giữa các lượt submit
+  errorLog: [],
+  delayMin: 3,
   delayMax: 5,
-  apiKey: null,
   abortReason: null,
 };
 
 /* ------------------------------------------------------------------
- * TIỆN ÍCH
+ * TIỆN ÍCH & THUẬT TOÁN TRÁO BÀI ĐỒNG ĐỀU (FISHER-YATES SHUFFLE)
  * ------------------------------------------------------------------ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -45,6 +40,15 @@ function randomDelayMs() {
   const lo = Math.max(0, Number(state.delayMin) || 0);
   const hi = Math.max(lo, Number(state.delayMax) || lo);
   return rand(lo, hi) * 1000;
+}
+
+function shuffleArray(arr) {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
 }
 
 function logError(index, error) {
@@ -61,7 +65,7 @@ function logError(index, error) {
 function statsPayload() {
   return {
     ...state.stats,
-    active: state.activeTabs.size + state.resolvingCount,
+    active: state.activeTabs.size,
     isRunning: state.isRunning,
     abortReason: state.abortReason,
     errorLog: state.errorLog,
@@ -76,10 +80,10 @@ async function persistStats(extra = {}) {
 }
 
 /* ------------------------------------------------------------------
- * SPINTAX: "{Vui vẻ|Buồn bã} trả lời: {{question}}" -> random 1 nhánh.
+ * SPINTAX & MULTI-LINE UNIFORM POOL
  * ------------------------------------------------------------------ */
 function parseSpintax(text) {
-  let out = String(text);
+  let out = String(text ?? '');
   const re = /(?<!\{)\{([^{}]*)\}(?!\})/g;
   let guard = 0;
   while (re.test(out) && guard++ < 20) {
@@ -91,56 +95,115 @@ function parseSpintax(text) {
   return out;
 }
 
+function pickUniformLine(deckKey, rawTextOrLines) {
+  const lines = Array.isArray(rawTextOrLines)
+    ? rawTextOrLines.map((s) => String(s).trim()).filter(Boolean)
+    : String(rawTextOrLines ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+  if (lines.length === 0) return '';
+  if (lines.length === 1) return parseSpintax(lines[0]);
+
+  let deck = state.textLineDecks.get(deckKey);
+  if (!deck || deck.length === 0) {
+    deck = shuffleArray(lines);
+    state.textLineDecks.set(deckKey, deck);
+  }
+  const chosen = deck.pop();
+  return parseSpintax(chosen);
+}
+
 /* ------------------------------------------------------------------
- * GEMINI 3.8 FLASH (Fail-safe 2: 3-Strike)
+ * PHÂN BỔ TỶ LỆ CHUNG CHO CÂU HỎI GRID NHIỀU DÒNG CON
  * ------------------------------------------------------------------ */
-async function callGemini(prompt, apiKey) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error('Gemini HTTP ' + res.status + ': ' + (await res.text()).slice(0, 300));
-    const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('')?.trim();
-    if (!text) throw new Error('Gemini trả về rỗng.');
-    state.apiErrorCount = 0;
-    return text;
-  } catch (e) {
-    state.apiErrorCount++;
-    if (state.apiErrorCount >= API_MAX_STRIKE) {
-      abortAll('Dừng khẩn cấp: Gemini API lỗi 3 lần liên tiếp (' + (e.message || e) + ')');
+function buildGridBasePools(payloads) {
+  state.gridBasePools.clear();
+  state.gridRowDecks.clear();
+  state.textLineDecks.clear();
+
+  for (const rawPayload of payloads) {
+    if (!rawPayload || typeof rawPayload !== 'object') continue;
+    for (const [qid, spec] of Object.entries(rawPayload)) {
+      if (!spec || spec.value === undefined || spec.value === null) continue;
+      if (!state.gridBasePools.has(qid)) {
+        state.gridBasePools.set(qid, []);
+      }
+      state.gridBasePools.get(qid).push(spec.value);
     }
-    throw e;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
-async function resolvePayload(rawPayload) {
+function drawGridRowAnswers(qid, fallbackValue, rowCount) {
+  const basePool = state.gridBasePools.get(qid);
+  if (!basePool || basePool.length === 0) {
+    return Array(rowCount).fill(fallbackValue);
+  }
+
+  const rowAnswers = [];
+  for (let r = 0; r < rowCount; r++) {
+    const deckKey = `${qid}_row_${r}`;
+    let deck = state.gridRowDecks.get(deckKey);
+    if (!deck || deck.length === 0) {
+      deck = shuffleArray(basePool);
+      state.gridRowDecks.set(deckKey, deck);
+    }
+    rowAnswers.push(deck.pop());
+  }
+  return rowAnswers;
+}
+
+function resolvePayload(rawPayload) {
   const items = [];
   for (const [qid, spec] of Object.entries(rawPayload)) {
     const meta = state.questionsMeta[qid] || { title: qid, type: 'TEXT' };
-    if (spec.kind === 'ai') {
-      const spun = parseSpintax(spec.prompt || '');
-      const finalPrompt = spun.split('{{question}}').join(meta.title);
-      const answer = await callGemini(finalPrompt, state.apiKey);
-      items.push({ questionId: qid, title: meta.title, type: meta.type, answer });
-      if (!state.isRunning) throw new Error('Đã dừng (abort trong lúc gọi AI).');
-    } else {
-      items.push({ questionId: qid, title: meta.title, type: meta.type, answer: spec.value });
+    const qType = meta.type || 'TEXT';
+
+    if (qType === 'GRID') {
+      if (spec.value && typeof spec.value === 'object' && !Array.isArray(spec.value) && !spec.value.other) {
+        items.push({ questionId: qid, title: meta.title, type: qType, answer: spec.value });
+      } else {
+        const rowCount = Number(meta.rowCount) || (Array.isArray(meta.gridRows) && meta.gridRows.length) || DEFAULT_GRID_ROWS;
+        const rowAnswers = drawGridRowAnswers(qid, spec.value, rowCount);
+        items.push({ questionId: qid, title: meta.title, type: 'GRID', answer: rowAnswers });
+      }
+      continue;
     }
+
+    if (spec.kind === 'ai' || spec.kind === 'pool' || qType === 'TEXT' || qType === 'PARAGRAPH') {
+      const rawLines = spec.lines || spec.prompt || spec.value || '';
+      const answer = pickUniformLine(`text_${qid}`, rawLines);
+      items.push({ questionId: qid, title: meta.title, type: qType, answer });
+      continue;
+    }
+
+    if (spec.value && typeof spec.value === 'object' && spec.value.other) {
+      const otherText = pickUniformLine(`other_${qid}`, spec.value.text || '');
+      items.push({
+        questionId: qid,
+        title: meta.title,
+        type: qType,
+        answer: { other: true, text: otherText }
+      });
+      continue;
+    }
+
+    if (Array.isArray(spec.value)) {
+      const resolvedArr = spec.value.map((v, idx) => {
+        if (v && typeof v === 'object' && v.other) {
+          return { other: true, text: pickUniformLine(`other_${qid}_${idx}`, v.text || '') };
+        }
+        return v;
+      });
+      items.push({ questionId: qid, title: meta.title, type: qType, answer: resolvedArr });
+      continue;
+    }
+
+    items.push({ questionId: qid, title: meta.title, type: qType, answer: spec.value });
   }
   return items;
 }
 
 /* ------------------------------------------------------------------
- * QUEUE MANAGER (Tối đa 10 tab ẩn + Chống Race Condition)
+ * QUEUE MANAGER (Tối đa 10 tab ẩn + Hỗ trợ Multi-page Reload)
  * ------------------------------------------------------------------ */
 async function pump() {
   if (!state.isRunning || state.isPumping) return;
@@ -149,34 +212,12 @@ async function pump() {
   try {
     while (
       state.isRunning &&
-      (state.activeTabs.size + state.resolvingCount) < MAX_CONCURRENT_TABS &&
+      state.activeTabs.size < MAX_CONCURRENT_TABS &&
       state.queue.length > 0
     ) {
       const rawPayload = state.queue.shift();
       const index = ++state.nextIndex;
-      state.resolvingCount++;
-      await persistStats();
-
-      let resolved;
-      try {
-        resolved = await resolvePayload(rawPayload);
-      } catch (e) {
-        state.resolvingCount = Math.max(0, state.resolvingCount - 1);
-        if (!state.isRunning) return;
-        state.stats.failed++;
-        logError(index, 'Lỗi Gemini khi sinh câu trả lời: ' + (e.message || e));
-        await persistStats();
-        checkFinished();
-        continue;
-      }
-
-      state.resolvingCount = Math.max(0, state.resolvingCount - 1);
-      if (!state.isRunning) {
-        state.queue.unshift(rawPayload);
-        state.nextIndex--;
-        return;
-      }
-
+      const resolved = resolvePayload(rawPayload);
       await openTabForPayload(resolved, index);
     }
   } finally {
@@ -188,7 +229,7 @@ async function pump() {
 async function openTabForPayload(resolvedPayload, index) {
   const tab = await chrome.tabs.create({ url: state.formUrl, active: false });
   const tabId = tab.id;
-  state.pendingSend.set(tabId, { payload: resolvedPayload, runId: state.runId, index });
+  state.tabJobs.set(tabId, { payload: resolvedPayload, runId: state.runId, index });
 
   armTabTimeout(tabId, index);
   await persistStats();
@@ -202,13 +243,13 @@ function armTabTimeout(tabId, index) {
     if (!cur) return;
     const wasSubmitted = !!cur.submitted;
     state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
+    state.tabJobs.delete(tabId);
     try { await chrome.tabs.remove(tabId); } catch { /* tab đã đóng */ }
     if (state.isRunning) {
       state.stats.failed++;
       const msg = wasSubmitted
-        ? `Form #${index} đã bấm Submit nhưng 30s vẫn chưa thấy trang cảm ơn (có thể dính captcha/xác minh), đã bỏ qua.`
-        : `Form #${index} timeout 30s (kẹt/mạng, không phản hồi), đã bỏ qua.`;
+        ? `Form #${index} đã bấm Submit nhưng hết thời gian chờ vẫn chưa thấy trang cảm ơn (nghi dính captcha/câu bắt buộc), đã bỏ qua.`
+        : `Form #${index} timeout 35s (kẹt câu hỏi hoặc mất mạng), đã bỏ qua.`;
       logError(index, msg);
       await persistStats({ lastError: msg });
       await sleep(Math.min(randomDelayMs(), 10 * 1000));
@@ -220,54 +261,62 @@ function armTabTimeout(tabId, index) {
   state.activeTabs.set(tabId, { ...meta, timeoutId, index });
 }
 
-// Khi tab load xong -> gửi kịch bản cho content.js điền
+// Khi tab tải xong (Trang 1, hoặc sau khi bấm "Tiếp" tải sang Trang 2, Trang 3, hoặc trang Cảm ơn sau khi bấm "Gửi")
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+
   const meta = state.activeTabs.get(tabId);
   if (!meta) return;
 
-  // QUAN TRỌNG: Chỉ chốt thành công qua URL "formResponse" NẾU tab đó ĐÃ bấm nút Submit (meta.submitted === true).
-  // Vì ở Form nhiều trang (Multi-page), khi bấm "Tiếp" sang trang 2, URL cũng đổi thành .../formResponse.
-  if (meta.submitted && (changeInfo.status === 'complete' || changeInfo.url)) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab && /formResponse/i.test(tab.url || '')) {
-        await finalizeTab(tabId, true, null);
-        return;
-      }
-    } catch { /* tab đã đóng */ }
-  }
-
-  if (changeInfo.status !== 'complete') return;
-  const job = state.pendingSend.get(tabId);
+  const job = state.tabJobs.get(tabId);
   if (!job || job.runId !== state.runId) return;
-  state.pendingSend.delete(tabId);
 
+  // Reset timeout mỗi khi tải xong trang mới
+  armTabTimeout(tabId, job.index);
+
+  // Luôn giao cho content.js kiểm tra DOM thực tế:
+  // - Nếu là trang Cảm Ơn thật sự (không còn câu hỏi, không còn nút Tiếp/Gửi) -> content.js gửi FORM_DONE
+  // - Nếu là Trang 1, Trang 2, Trang 3... -> content.js điền tiếp và bấm Tiếp/Gửi
   try {
-    await chrome.tabs.sendMessage(tabId, { type: 'FILL_FORM', payload: job.payload, runId: job.runId });
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'FILL_FORM',
+      payload: job.payload,
+      runId: job.runId
+    });
   } catch {
-    const curMeta = state.activeTabs.get(tabId);
-    if (curMeta) {
-      clearTimeout(curMeta.timeoutId);
-      state.activeTabs.delete(tabId);
-    }
-    try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
-    if (state.isRunning) {
-      state.stats.failed++;
-      const msg = `Form #${job.index ?? '?'}: không gửi được kịch bản tới tab (trang chặn/Captcha), đã bỏ qua.`;
-      logError(job.index ?? '?', msg);
-      await persistStats({ lastError: msg });
-      pump();
+    await sleep(600);
+    if (!state.activeTabs.has(tabId)) return;
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'FILL_FORM',
+        payload: job.payload,
+        runId: job.runId
+      });
+    } catch {
+      const curMeta = state.activeTabs.get(tabId);
+      if (curMeta) {
+        clearTimeout(curMeta.timeoutId);
+        state.activeTabs.delete(tabId);
+      }
+      state.tabJobs.delete(tabId);
+      try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
+      if (state.isRunning) {
+        state.stats.failed++;
+        const msg = `Form #${job.index ?? '?'}: không gửi được kịch bản tới tab, đã bỏ qua.`;
+        logError(job.index ?? '?', msg);
+        await persistStats({ lastError: msg });
+        pump();
+      }
     }
   }
 });
 
-// Tab bị đóng tay hoặc crash -> cập nhật failed và kích hoạt lại pump() để không treo phiên chạy
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (state.activeTabs.has(tabId)) {
     const meta = state.activeTabs.get(tabId);
     clearTimeout(meta.timeoutId);
     state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
+    state.tabJobs.delete(tabId);
     if (state.isRunning) {
       state.stats.failed++;
       const msg = `Form #${meta.index}: Tab bị đóng đột ngột trước khi hoàn tất.`;
@@ -286,7 +335,7 @@ async function finalizeTab(tabId, ok, error) {
   if (!meta) return false;
   clearTimeout(meta.timeoutId);
   state.activeTabs.delete(tabId);
-  state.pendingSend.delete(tabId);
+  state.tabJobs.delete(tabId);
   try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
   if (!state.isRunning) { await persistStats(); return true; }
 
@@ -308,7 +357,7 @@ async function finalizeTab(tabId, ok, error) {
 
 function checkFinished() {
   if (!state.isRunning) return;
-  if (state.queue.length === 0 && state.activeTabs.size === 0 && state.resolvingCount === 0) {
+  if (state.queue.length === 0 && state.activeTabs.size === 0) {
     state.isRunning = false;
     persistStats({ finishedAt: Date.now() });
   }
@@ -317,10 +366,9 @@ function checkFinished() {
 async function abortAll(reason) {
   state.isRunning = false;
   state.isPumping = false;
-  state.resolvingCount = 0;
   state.abortReason = reason || 'Người dùng dừng khẩn cấp.';
   state.queue = [];
-  state.pendingSend.clear();
+  state.tabJobs.clear();
   const tabs = [...state.activeTabs.keys()];
   for (const [, meta] of state.activeTabs) clearTimeout(meta.timeoutId);
   state.activeTabs.clear();
@@ -341,22 +389,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'Đang có phiên chạy, hãy dừng trước.' });
           return;
         }
-        await chrome.storage.session.set({ geminiApiKey: msg.apiKey || '' });
-        state.apiKey = msg.apiKey || '';
+        const rawPayloads = msg.payloads || [];
         state.isRunning = true;
         state.isPumping = false;
-        state.resolvingCount = 0;
         state.nextIndex = 0;
         state.runId = 'run_' + Date.now();
         state.formUrl = msg.formUrl;
-        state.queue = [...(msg.payloads || [])];
+        state.queue = [...rawPayloads];
         state.questionsMeta = msg.questionsMeta || {};
         state.stats = { total: state.queue.length, success: 0, failed: 0 };
         state.errorLog = [];
-        state.apiErrorCount = 0;
         state.abortReason = null;
         state.delayMin = msg.delayMin;
         state.delayMax = msg.delayMax;
+
+        buildGridBasePools(rawPayloads);
+
         await persistStats({ total: state.stats.total });
         sendResponse({ ok: true, runId: state.runId });
         pump();
@@ -387,6 +435,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ack: true });
         break;
       }
+      case 'FORM_NEXT_PAGE':
       case 'FORM_HEARTBEAT': {
         if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
         const meta = state.activeTabs.get(sender.tab.id);
