@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forms AI Auto-Fill</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="logo">📝</div>
+    <div>
+      <h1>Forms AI Auto-Fill</h1>
+      <p id="formTitle" class="form-title">Chưa tải form…</p>
+    </div>
+  </header>
+
+  <!-- ============ GIAO DIỆN 1: NHẬP CONFIG ============ -->
+  <section id="view-config">
+    <div id="loadState" class="notice">Đang bóc tách cấu trúc form từ tab hiện tại…</div>
+    <div id="questionList" class="q-list"></div>
+
+    <fieldset class="global-box">
+      <legend>Cài đặt chung</legend>
+      <label>Tổng số form cần submit
+        <input id="inTotal" type="number" min="1" max="1000" value="10" />
+      </label>
+      <div class="row2">
+        <label>Delay Min (giây)
+          <input id="inDelayMin" type="number" min="0" step="1" value="3" />
+        </label>
+        <label>Delay Max (giây)
+          <input id="inDelayMax" type="number" min="0" step="1" value="5" />
+        </label>
+      </div>
+      <label>Gemini API Key <span class="hint">(chỉ lưu session, tự xóa khi đóng trình duyệt)</span>
+        <input id="inApiKey" type="password" placeholder="AIza…" autocomplete="off" />
+      </label>
+      <div id="configError" class="error"></div>
+      <button id="btnStart" class="btn primary" disabled>Bắt đầu chạy ▶</button>
+    </fieldset>
+  </section>
+
+  <!-- ============ GIAO DIỆN 2: TRACKING ============ -->
+  <section id="view-tracking" hidden>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div id="progressFill"></div></div>
+      <div id="progressText" class="progress-text">0%</div>
+    </div>
+    <div class="stats">
+      <div class="stat">🎯 Yêu cầu<br /><b id="stTotal">0</b></div>
+      <div class="stat ok">✅ Thành công<br /><b id="stSuccess">0</b></div>
+      <div class="stat err">❌ Lỗi / Bỏ qua<br /><b id="stFailed">0</b></div>
+      <div class="stat run">⏳ Đang chạy<br /><b id="stActive">0</b></div>
+    </div>
+    <div id="abortReason" class="error"></div>
+    <div id="lastError" class="notice small"></div>
+    <div class="err-head">Chi tiết lỗi (<span id="errCount">0</span>)</div>
+    <div id="errorList" class="err-list"></div>
+    <div class="row2">
+      <button id="btnStop" class="btn danger">⛔ Dừng khẩn cấp</button>
+      <button id="btnBack" class="btn ghost">← Cấu hình mới</button>
+    </div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>
