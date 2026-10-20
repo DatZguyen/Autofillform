@@ -1,0 +1,10 @@
+{
+  "name": "google-forms-ai-auto-filler",
+  "version": "1.2.0",
+  "description": "Chrome Extension: bóc tách Google Forms multi-page, phân bổ tỷ lệ đáp án, chọn random nội dung nhập liệu, submit đa nhiệm 10 tab. Không dùng AI.",
+  "private": true,
+  "scripts": {
+    "test": "node tests/content.test.js && node tests/popup.test.js && node tests/pump.test.js && node tests/wiring.test.js",
+    "lint": "node --check scripts/content.js && node --check scripts/background.js && node --check popup/popup.js"
+  }
+}

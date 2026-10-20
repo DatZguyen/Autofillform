@@ -1,11 +1,11 @@
 # THIẾT KẾ KIẾN TRÚC & HƯỚNG DẪN TRIỂN KHAI (BLUEPRINT)
-## Dự án: Extension Auto-Fill Google Forms Thông Minh (Tích hợp AI & Đa nhiệm)
+## Dự án: Extension Auto-Fill Google Forms Thông Minh (Đa nhiệm, Không dùng AI)
 
 ---
 
 ## 1. TỔNG QUAN DỰ ÁN (PROJECT OVERVIEW)
 Đây là một Chrome/Edge Extension (Manifest V3) được thiết kế để tự động hóa việc điền và submit Google Forms với số lượng lớn. 
-Điểm nổi bật của dự án là khả năng phân bổ tỷ lệ đáp án chính xác bằng toán học, tích hợp AI (Gemini) để sinh câu trả lời nhập liệu đa dạng, và cơ chế chạy đa nhiệm ngầm thông minh không làm treo trình duyệt.
+Điểm nổi bật của dự án là khả năng phân bổ tỷ lệ đáp án chính xác bằng toán học, nhập **danh sách đáp án nhiều dòng** và chọn ngẫu nhiên 1 đáp án cho mỗi form, và cơ chế chạy đa nhiệm ngầm thông minh không làm treo trình duyệt. Không cần AI hay API Key.
 
 **Phạm vi (Scope):** Chỉ hỗ trợ Google Forms.
 
@@ -22,7 +22,7 @@ Dự án bao gồm các file cốt lõi sau:
 │   ├── popup.css       # Style cho giao diện.
 │   └── popup.js        # Xử lý logic UI, gửi thông điệp cấu hình tới Background.
 ├── scripts/
-│   ├── background.js   # Service Worker (Bộ não): Quản lý Queue 10 tab, đếm lỗi API, delay, gọi Gemini API.
+│   ├── background.js   # Service Worker (Bộ não): Quản lý Queue 10 tab, delay, quản lý vòng đời tab.
 │   └── content.js      # Script chạy trên trang Google Forms: Bóc tách dữ liệu, nhận kịch bản từ Background và thực thi click/điền text.
 └── assets/
     └── icons/          # Chứa icon của extension (16, 48, 128px).
@@ -48,14 +48,19 @@ Cộng thêm 1 form cho các lựa chọn có phần thập phân lớn nhất (
 
 Đầu ra: Mảng [100 kịch bản], mỗi kịch bản là 1 bộ đáp án hoàn chỉnh cho 1 form.
 
-3.3. Tích hợp AI (Gemini 2.5 Flash) & Prompt
-Bảo mật API: Người dùng nhập API Key vào ô trong Popup. Key chỉ được lưu ở chrome.storage.session (Tự xóa khi đóng trình duyệt).
+3.3. NHẬP LIỆU TỪ DANH SÁCH NHIỀU DÒNG (KHÔNG DÙNG AI)
 
-Custom Prompt: Có ô nhập Prompt tùy chỉnh kèm Spintax và biến {{question}}.
+Mỗi câu hỏi nhập liệu có 1 ô textarea: MỖI DÒNG là 1 đáp án.
 
-Ví dụ Spintax: {Vui vẻ|Buồn bã}, trả lời câu hỏi: {{question}}. Background.js phải parse Spintax này thành 1 prompt cụ thể trước khi gọi API.
+Khi sinh kịch bản cho từng form, hệ thống chọn NGẪU NHIÊN đúng 1 dòng để điền vào ô trả lời.
 
-Cơ chế gọi: background.js gọi fetch() tới API Gemini. Nhận text text trả về và nhúng vào kịch bản form.
+Hàm dùng ở popup.js:
+- splitAnswers(raw): tách chuỗi textarea thành mảng đáp án (bỏ dòng trống, trim).
+- pickRandomAnswer(list): lấy ngẫu nhiên 1 phần tử.
+
+Spintax {A|B} vẫn hỗ trợ ở cấp từng dòng.
+
+Không còn API Key, không còn gọi mạng ra ngoài.
 
 3.4. Quản lý Đa nhiệm & Hàng đợi (Concurrency Queue)
 Giới hạn luồng: Tối đa 10 tab ẩn chạy cùng lúc.
@@ -75,13 +80,13 @@ Hệ thống KHÔNG ĐƯỢC CHẾT giữa chừng, áp dụng các quy tắc sa
 
 Quy tắc Form Kẹt (30s Timeout): Khi background mở 1 tab, nó đặt một bộ đếm. Nếu sau 30 giây tab đó không báo cáo hoàn thành (do rớt mạng, dính Captcha, web lag...), đóng tab ngay lập tức. Đánh dấu form đó là Skipped (Bỏ qua) và chạy form tiếp theo.
 
-Quy tắc API 3-Strike (Dừng hệ thống): Khởi tạo biến apiErrorCount = 0. Mỗi lần gọi Gemini API bị Timeout/Lỗi mạng, apiErrorCount++. Nếu thành công, apiErrorCount = 0. Nếu apiErrorCount === 3:
+Quy tắc giới hạn 5 phút / tab:
 
-Gửi lệnh ngắt toàn bộ hàng đợi.
+Mỗi tab có startedAt. Nếu chạy quá TAB_MAX_LIFETIME_MS (5 phút) mà chưa hoàn tất -> đóng tab, đánh dấu Skipped, chạy form tiếp theo. Không dừng hệ thống.
 
-Đóng toàn bộ các tab ẩn đang mở.
+Quy tắc Abort:
 
-Hiển thị thông báo (Notification) "Dừng khẩn cấp: Gemini API lỗi 3 lần liên tiếp."
+Người dùng bấm "DỪNG KHẨN CẤP" -> xoá hàng đợi, đóng toàn bộ tab đang chạy, hiển thị lý do trên giao diện.
 
 4. GIAO DIỆN NGƯỜI DÙNG (POPUP UI)
 Giao diện Popup gồm 3 trạng thái chính:
@@ -92,11 +97,9 @@ Danh sách câu hỏi (Lấy từ FB_PUBLIC_LOAD_DATA_).
 
 Các input nhập % cho từng đáp án trắc nghiệm.
 
-Câu hỏi Text: Checkbox "Dùng AI", ô nhập Custom Prompt, ô nhập Text tĩnh (nếu không dùng AI).
+Câu hỏi Text: 1 ô textarea nhiều dòng — mỗi dòng là 1 đáp án, chọn ngẫu nhiên 1 dòng cho mỗi form.
 
 Cài đặt chung: Tổng số form cần điền, Min Delay, Max Delay (tính bằng phút).
-
-Ô nhập Gemini API Key.
 
 Nút "Bắt đầu chạy".
 
@@ -125,6 +128,6 @@ Bước 3 (Queue Manager): Viết class FormQueueManager trong background.js qu�
 
 Bước 4 (Auto-Fill Content Script): Viết logic trong content.js để đọc 1 kịch bản và thực thi click DOM, điền text, qua trang và submit.
 
-Bước 5 (AI Integration): Tích hợp hàm fetch Gemini API vào background. Cài đặt luật 3-Strike Error.
+Bước 5 (Danh sách đáp án): Cho phép nhập nhiều đáp án (mỗi dòng 1 đáp án) và chọn ngẫu nhiên 1 đáp án cho mỗi form.
 
 Bước 6 (Refining): Test thử nghiệm, thêm hàm delay ngẫu nhiên vào Queue Manager, tối ưu hóa Tracking UI.

@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Forms AI Auto-Fill</title>
+  <title>Forms Auto-Fill</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
   <header class="app-header">
     <div class="logo">📝</div>
     <div>
-      <h1>Forms AI Auto-Fill</h1>
+      <h1>Forms Auto-Fill</h1>
       <p id="formTitle" class="form-title">Chưa tải form…</p>
     </div>
   </header>
@@ -33,9 +33,6 @@
           <input id="inDelayMax" type="number" min="0" step="1" value="5" />
         </label>
       </div>
-      <label>Gemini API Key <span class="hint">(chỉ lưu session, tự xóa khi đóng trình duyệt)</span>
-        <input id="inApiKey" type="password" placeholder="AIza…" autocomplete="off" />
-      </label>
       <div id="configError" class="error"></div>
       <button id="btnStart" class="btn primary" disabled>Bắt đầu chạy ▶</button>
     </fieldset>
@@ -52,6 +49,7 @@
       <div class="stat ok">✅ Thành công<br /><b id="stSuccess">0</b></div>
       <div class="stat err">❌ Lỗi / Bỏ qua<br /><b id="stFailed">0</b></div>
       <div class="stat run">⏳ Đang chạy<br /><b id="stActive">0</b></div>
+      <div class="stat skip">↪️ Bỏ qua (nhánh rẽ)<br /><b id="stSkipped">0</b></div>
     </div>
     <div id="abortReason" class="error"></div>
     <div id="lastError" class="notice small"></div>
