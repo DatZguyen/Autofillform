@@ -1,55 +1,67 @@
 /* ============================================================================
  * background.js — Service Worker (BỘ NÃO)
- * - Queue Manager: tối đa 10 tab ẩn cùng lúc
- * - Resolve AI (Gemini 2.5 Flash) + Spintax cho câu hỏi text
- * - Fail-safe 1: timeout 30s / tab  |  Fail-safe 2: API lỗi 3 lần liên tiếp
- * - Delay ngẫu nhiên Min–Max (phút) giữa các lượt submit
+ * - Queue Manager: tối đa 10 tab ẩn cùng lúc (chống Race Condition)
+ * - Hỗ trợ Multi-page Google Forms: Khi bấm "Tiếp" hoặc "Submit" làm trang
+ *   reload sang URL .../formResponse, background gửi lại payload để content.js
+ *   điền tiếp trang 2, 3... hoặc xác nhận chính xác trang Cảm Ơn trước khi đóng tab.
  * ========================================================================== */
 
-// --- Hằng số cấu hình ---
-const MAX_CONCURRENT_TABS = 10;   // giới hạn đa nhiệm
-const TAB_TIMEOUT_MS = 30 * 1000; // Fail-safe 1: 30 giây / tab
-const API_MAX_STRIKE = 3;         // Fail-safe 2: 3 lỗi liên tiếp -> dừng hệ thống
-const GEMINI_MODEL = 'gemini-2.5-flash';
-const GEMINI_TIMEOUT_MS = 25 * 1000;
+const MAX_CONCURRENT_TABS = 10;
+const TAB_TIMEOUT_MS = 35 * 1000;
+const DEFAULT_GRID_ROWS = 40;
 
-// --- State toàn cục của 1 phiên chạy ---
 const state = {
   isRunning: false,
+  isPumping: false,
+  nextIndex: 0,
   runId: null,
   formUrl: null,
-  queue: [],            // mảng payload thô chờ xử lý (mỗi phần tử = 1 form)
-  questionsMeta: {},    // { qid: {title, type} }
-  activeTabs: new Map(),// tabId -> { timeoutId, index }
-  pendingSend: new Map(), // tabId -> payload đã resolve, chờ tab load xong
+  queue: [],
+  questionsMeta: {},
+  gridBasePools: new Map(),
+  gridRowDecks: new Map(),
+  textLineDecks: new Map(),
+  activeTabs: new Map(),  // tabId -> { timeoutId, index, submitted }
+  tabJobs: new Map(),     // tabId -> { payload, runId, index }
   stats: { total: 0, success: 0, failed: 0 },
-  errorLog: [],       // nhật ký lỗi chi tiết [{index (số form), error, time}]
-  apiErrorCount: 0,
-  delayMin: 3,           // GIÂY giữa các lượt submit (user đổi trong popup)
+  errorLog: [],
+  delayMin: 3,
   delayMax: 5,
-  apiKey: null,
   abortReason: null,
 };
 
 /* ------------------------------------------------------------------
- * TIỆN ÍCH
+ * TIỆN ÍCH & THUẬT TOÁN TRÁO BÀI ĐỒNG ĐỀU (FISHER-YATES SHUFFLE)
  * ------------------------------------------------------------------ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.random() * (b - a);
-// Delay ngẫu nhiên Min–Max (đơn vị GIÂY, đồng bộ với hiển thị ở popup) -> đổi ra ms
+
 function randomDelayMs() {
   const lo = Math.max(0, Number(state.delayMin) || 0);
   const hi = Math.max(lo, Number(state.delayMax) || lo);
   return rand(lo, hi) * 1000;
 }
 
-// Ghi 1 dòng lỗi chi tiết (form số mấy, lỗi gì, ở đâu) — popup hiển thị khi chạy xong
-function logError(index, error) {
-  state.errorLog.push({ index, error: String(error || 'Không rõ lỗi'), time: new Date().toLocaleTimeString('vi-VN') });
-  if (state.errorLog.length > 500) state.errorLog.splice(0, state.errorLog.length - 500); // chống tràn storage
+function shuffleArray(arr) {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
 }
 
-// Gom stats + nhật ký lỗi để popup (Tracking UI) đọc được ngay cả khi đóng/mở lại
+function logError(index, error) {
+  state.errorLog.push({
+    index,
+    error: String(error || 'Không rõ lỗi'),
+    time: new Date().toLocaleTimeString('vi-VN'),
+  });
+  if (state.errorLog.length > 500) {
+    state.errorLog.splice(0, state.errorLog.length - 500);
+  }
+}
+
 function statsPayload() {
   return {
     ...state.stats,
@@ -60,23 +72,18 @@ function statsPayload() {
   };
 }
 
-// Lưu stats để popup (Tracking UI) đọc được ngay cả khi popup đóng/mở lại
 async function persistStats(extra = {}) {
   await chrome.storage.local.set({ runStats: { ...statsPayload(), ...extra } });
-  // Đẩy sự kiện realtime cho popup đang mở
   try {
     await chrome.runtime.sendMessage({ type: 'STATS_UPDATE', stats: statsPayload() });
   } catch { /* popup đang đóng -> bỏ qua */ }
 }
 
 /* ------------------------------------------------------------------
- * SPINTAX: "{Vui vẻ|Buồn bã} trả lời: {{question}}" -> random 1 nhánh.
- * Hỗ trợ lồng nhau bằng cách lặp đến khi hết dấu {..|..}.
- * Lưu ý: {{question}} là biến template -> giữ nguyên, chỉ parse {a|b}.
+ * SPINTAX & MULTI-LINE UNIFORM POOL
  * ------------------------------------------------------------------ */
 function parseSpintax(text) {
-  let out = String(text);
-  // Khớp { ... } NHƯNG bỏ qua {{...}} (biến template 2 ngoặc)
+  let out = String(text ?? '');
   const re = /(?<!\{)\{([^{}]*)\}(?!\})/g;
   let guard = 0;
   while (re.test(out) && guard++ < 20) {
@@ -88,102 +95,197 @@ function parseSpintax(text) {
   return out;
 }
 
+function pickUniformLine(deckKey, rawTextOrLines) {
+  const lines = Array.isArray(rawTextOrLines)
+    ? rawTextOrLines.map((s) => String(s).trim()).filter(Boolean)
+    : String(rawTextOrLines ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+  if (lines.length === 0) return '';
+  if (lines.length === 1) return parseSpintax(lines[0]);
+
+  let deck = state.textLineDecks.get(deckKey);
+  if (!deck || deck.length === 0) {
+    deck = shuffleArray(lines);
+    state.textLineDecks.set(deckKey, deck);
+  }
+  const chosen = deck.pop();
+  return parseSpintax(chosen);
+}
+
 /* ------------------------------------------------------------------
- * GEMINI 2.5 FLASH (Fail-safe 2: 3-Strike)
+ * PHÂN BỔ TỶ LỆ CHUNG CHO CÂU HỎI GRID NHIỀU DÒNG CON
  * ------------------------------------------------------------------ */
-async function callGemini(prompt, apiKey) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error('Gemini HTTP ' + res.status + ': ' + (await res.text()).slice(0, 300));
-    const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('')?.trim();
-    if (!text) throw new Error('Gemini trả về rỗng.');
-    state.apiErrorCount = 0; // thành công -> reset bộ đếm
-    return text;
-  } catch (e) {
-    state.apiErrorCount++;
-    if (state.apiErrorCount >= API_MAX_STRIKE) {
-      // Kích hoạt dừng khẩn cấp toàn hệ thống
-      abortAll('Dừng khẩn cấp: Gemini API lỗi 3 lần liên tiếp (' + (e.message || e) + ')');
+function buildGridBasePools(payloads) {
+  state.gridBasePools.clear();
+  state.gridRowDecks.clear();
+  state.textLineDecks.clear();
+
+  for (const rawPayload of payloads) {
+    if (!rawPayload || typeof rawPayload !== 'object') continue;
+    for (const [qid, spec] of Object.entries(rawPayload)) {
+      if (!spec || spec.value === undefined || spec.value === null) continue;
+      if (!state.gridBasePools.has(qid)) {
+        state.gridBasePools.set(qid, []);
+      }
+      state.gridBasePools.get(qid).push(spec.value);
     }
-    throw e;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
-// Resolve 1 payload thô -> payload hoàn chỉnh cho content.js
-// rawPayload: { [qid]: {kind:'choice', value} | {kind:'static', value} | {kind:'ai', prompt, questionTitle} }
-async function resolvePayload(rawPayload) {
+function drawGridRowAnswers(qid, fallbackValue, rowCount) {
+  const basePool = state.gridBasePools.get(qid);
+  if (!basePool || basePool.length === 0) {
+    return Array(rowCount).fill(fallbackValue);
+  }
+
+  const rowAnswers = [];
+  for (let r = 0; r < rowCount; r++) {
+    const deckKey = `${qid}_row_${r}`;
+    let deck = state.gridRowDecks.get(deckKey);
+    if (!deck || deck.length === 0) {
+      deck = shuffleArray(basePool);
+      state.gridRowDecks.set(deckKey, deck);
+    }
+    rowAnswers.push(deck.pop());
+  }
+  return rowAnswers;
+}
+
+function resolvePayload(rawPayload) {
   const items = [];
   for (const [qid, spec] of Object.entries(rawPayload)) {
     const meta = state.questionsMeta[qid] || { title: qid, type: 'TEXT' };
-    if (spec.kind === 'ai') {
-      // 1. Parse Spintax trước, 2. thay {{question}} bằng tiêu đề thật, 3. gọi API
-      const spun = parseSpintax(spec.prompt || '');
-      const finalPrompt = spun.split('{{question}}').join(meta.title);
-      const answer = await callGemini(finalPrompt, state.apiKey);
-      items.push({ questionId: qid, title: meta.title, type: meta.type, answer });
-      if (!state.isRunning) throw new Error('Đã dừng (abort trong lúc gọi AI).');
-    } else {
-      items.push({ questionId: qid, title: meta.title, type: meta.type, answer: spec.value });
+    const qType = meta.type || 'TEXT';
+
+    if (qType === 'GRID') {
+      const v = spec.value;
+
+      // (1) Cấu hình RIÊNG theo từng dòng con (popup đã tách sẵn):
+      //     - Object có "__rowAnswers" (mảng theo thứ tự dòng)
+      //     - Object ánh xạ "Tên dòng" -> đáp án
+      //     - Mảng phẳng (đáp án theo thứ tự dòng)
+      //     -> TRUYỀN NGUYÊN VẸN, KHÔNG ghi đè bằng bộ tỷ lệ chung.
+      const isPerRowObject = v && typeof v === 'object' && !Array.isArray(v) && !v.other;
+      const isPerRowArray = Array.isArray(v);
+      if (isPerRowObject || isPerRowArray) {
+        items.push({
+          questionId: qid,
+          inputId: meta.inputId,
+          title: meta.title,
+          type: qType,
+          page: meta.page || 1,
+          answer: v,
+        });
+        continue;
+      }
+
+      // (2) FALLBACK cho cấu hình cũ (1 giá trị dùng chung cho mọi dòng):
+      //     rút ngẫu nhiên 1 đáp án cho từng dòng từ "bộ bài" (Fisher-Yates).
+      const rowCount = Number(meta.rowCount)
+        || (Array.isArray(meta.gridRows) && meta.gridRows.length)
+        || DEFAULT_GRID_ROWS;
+      const rowAnswers = drawGridRowAnswers(qid, v, rowCount);
+      items.push({
+        questionId: qid,
+        inputId: meta.inputId,
+        title: meta.title,
+        type: 'GRID',
+        page: meta.page || 1,
+        answer: rowAnswers,
+      });
+      continue;
     }
+
+    if (spec.kind === 'pool' || qType === 'TEXT' || qType === 'PARAGRAPH') {
+      const rawLines = spec.lines || spec.prompt || spec.value || '';
+      const answer = pickUniformLine(`text_${qid}`, rawLines);
+      items.push({
+        questionId: qid,
+        inputId: meta.inputId,
+        title: meta.title,
+        type: qType,
+        page: meta.page || 1,
+        answer,
+      });
+      continue;
+    }
+
+    if (spec.value && typeof spec.value === 'object' && spec.value.other) {
+      const otherText = pickUniformLine(`other_${qid}`, spec.value.text || '');
+      items.push({
+        questionId: qid,
+        inputId: meta.inputId,
+        title: meta.title,
+        type: qType,
+        page: meta.page || 1,
+        answer: { other: true, text: otherText }
+      });
+      continue;
+    }
+
+    if (Array.isArray(spec.value)) {
+      const resolvedArr = spec.value.map((v, idx) => {
+        if (v && typeof v === 'object' && v.other) {
+          return { other: true, text: pickUniformLine(`other_${qid}_${idx}`, v.text || '') };
+        }
+        return v;
+      });
+      items.push({
+        questionId: qid,
+        inputId: meta.inputId,
+        title: meta.title,
+        type: qType,
+        page: meta.page || 1,
+        answer: resolvedArr,
+      });
+      continue;
+    }
+
+    items.push({
+      questionId: qid,
+      inputId: meta.inputId,
+      title: meta.title,
+      type: qType,
+      page: meta.page || 1,
+      answer: spec.value,
+    });
   }
   return items;
 }
 
 /* ------------------------------------------------------------------
- * QUEUE MANAGER (tối đa 10 tab ẩn)
+ * QUEUE MANAGER (Tối đa 10 tab ẩn + Hỗ trợ Multi-page Reload)
  * ------------------------------------------------------------------ */
 async function pump() {
-  if (!state.isRunning) return;
-  // Mở tab mới cho đến khi đủ 10 tab hoặc hết hàng đợi
-  while (state.isRunning && state.activeTabs.size < MAX_CONCURRENT_TABS && state.queue.length > 0) {
-    const rawPayload = state.queue.shift();
-    const index = state.stats.success + state.stats.failed + state.activeTabs.size + 1;
-    // Resolve AI TRƯỚC khi mở tab (để tab mở ra là điền ngay, không chờ)
-    let resolved;
-    try {
-      resolved = await resolvePayload(rawPayload);
-    } catch (e) {
-      if (!state.isRunning) return; // đã abort (3-strike / user dừng)
-      // Lỗi AI lẻ (chưa đủ 3 strike): coi form này là failed, đi tiếp
-      state.stats.failed++;
-      logError(index, 'Lỗi Gemini khi sinh câu trả lời: ' + (e.message || e));
-      await persistStats();
-      checkFinished();
-      continue;
+  if (!state.isRunning || state.isPumping) return;
+  state.isPumping = true;
+
+  try {
+    while (
+      state.isRunning &&
+      state.activeTabs.size < MAX_CONCURRENT_TABS &&
+      state.queue.length > 0
+    ) {
+      const rawPayload = state.queue.shift();
+      const index = ++state.nextIndex;
+      const resolved = resolvePayload(rawPayload);
+      await openTabForPayload(resolved, index);
     }
-    if (!state.isRunning) {
-      // Trong lúc resolve thì user bấm Dừng -> trả payload về queue rồi thoát
-      state.queue.unshift(rawPayload);
-      return;
-    }
-    await openTabForPayload(resolved, index);
+  } finally {
+    state.isPumping = false;
+    checkFinished();
   }
-  checkFinished();
 }
 
 async function openTabForPayload(resolvedPayload, index) {
   const tab = await chrome.tabs.create({ url: state.formUrl, active: false });
   const tabId = tab.id;
-  state.pendingSend.set(tabId, { payload: resolvedPayload, runId: state.runId, index });
+  state.tabJobs.set(tabId, { payload: resolvedPayload, runId: state.runId, index });
 
-  armTabTimeout(tabId, index); // Fail-safe 1: 30s không heartbeat/báo cáo -> đóng tab
+  armTabTimeout(tabId, index);
   await persistStats();
 }
 
-// Đặt (hoặc reset khi có heartbeat) bộ đếm timeout 30s cho 1 tab.
-// Chỉ tab "chết lặng" (kẹt/Captcha/rớt mạng, không heartbeat) mới bị đóng oan tránh;
-// tab đang điền form dài vẫn heartbeat đều nên không bao giờ bị giết giữa chừng.
 function armTabTimeout(tabId, index) {
   const old = state.activeTabs.get(tabId);
   if (old) clearTimeout(old.timeoutId);
@@ -192,19 +294,16 @@ function armTabTimeout(tabId, index) {
     if (!cur) return;
     const wasSubmitted = !!cur.submitted;
     state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
+    state.tabJobs.delete(tabId);
     try { await chrome.tabs.remove(tabId); } catch { /* tab đã đóng */ }
     if (state.isRunning) {
       state.stats.failed++;
-      // Phân biệt 2 ca: đã bấm Submit nhưng không thấy trang cảm ơn (nghi captcha/
-      // xác minh) vs tab chết lặng từ đầu (kẹt/mạng).
       const msg = wasSubmitted
-        ? `Form #${index} đã bấm Submit nhưng 30s vẫn chưa thấy trang cảm ơn (có thể dính captcha/xác minh), đã bỏ qua.`
-        : `Form #${index} timeout 30s (kẹt/mạng, không phản hồi), đã bỏ qua.`;
+        ? `Form #${index} đã bấm Submit nhưng hết thời gian chờ vẫn chưa thấy trang cảm ơn (nghi dính captcha/câu bắt buộc), đã bỏ qua.`
+        : `Form #${index} timeout 35s (kẹt câu hỏi hoặc mất mạng), đã bỏ qua.`;
       logError(index, msg);
       await persistStats({ lastError: msg });
-      // Delay ngẫu nhiên rồi bơm tiếp để tránh dồn dập
-      await sleep(Math.min(randomDelayMs(), 10 * 1000)); // timeout retry chờ tối đa 10s
+      await sleep(Math.min(randomDelayMs(), 10 * 1000));
       pump();
     }
   }, TAB_TIMEOUT_MS);
@@ -213,64 +312,81 @@ function armTabTimeout(tabId, index) {
   state.activeTabs.set(tabId, { ...meta, timeoutId, index });
 }
 
-// Khi tab load xong -> gửi kịch bản cho content.js điền
+// Khi tab tải xong (Trang 1, hoặc sau khi bấm "Tiếp" tải sang Trang 2, Trang 3, hoặc trang Cảm ơn sau khi bấm "Gửi")
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  // Trang cảm ơn sau submit có URL chứa "formResponse" -> chốt THÀNH CÔNG + kill tab
-  // NGAY LẬP TỨC, không chờ content báo (script trong tab có thể đã chết khi chuyển trang).
-  if (changeInfo.status === 'complete' || changeInfo.url) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab && /formResponse/i.test(tab.url || '') && state.activeTabs.has(tabId)) {
-        await finalizeTab(tabId, true, null);
-        return;
-      }
-    } catch { /* tab đã đóng */ }
-  }
-
   if (changeInfo.status !== 'complete') return;
-  const job = state.pendingSend.get(tabId);
+
+  const meta = state.activeTabs.get(tabId);
+  if (!meta) return;
+
+  const job = state.tabJobs.get(tabId);
   if (!job || job.runId !== state.runId) return;
-  state.pendingSend.delete(tabId);
+
+  // Reset timeout mỗi khi tải xong trang mới
+  armTabTimeout(tabId, job.index);
+
+  // Luôn giao cho content.js kiểm tra DOM thực tế:
+  // - Nếu là trang Cảm Ơn thật sự (không còn câu hỏi, không còn nút Tiếp/Gửi) -> content.js gửi FORM_DONE
+  // - Nếu là Trang 1, Trang 2, Trang 3... -> content.js điền tiếp và bấm Tiếp/Gửi
   try {
-    await chrome.tabs.sendMessage(tabId, { type: 'FILL_FORM', payload: job.payload, runId: job.runId });
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'FILL_FORM',
+      payload: job.payload,
+      runId: job.runId
+    });
   } catch {
-    // content.js chưa sẵn sàng (trang lỗi/Captcha): dọn tab, đánh failed
-    const meta = state.activeTabs.get(tabId);
-    if (meta) {
-      clearTimeout(meta.timeoutId);
-      state.activeTabs.delete(tabId);
-    }
-    try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
-    if (state.isRunning) {
-      state.stats.failed++;
-      const msg = `Form #${job.index ?? '?'}: không gửi được kịch bản tới tab (trang chặn/Captcha), đã bỏ qua.`;
-      logError(job.index ?? '?', msg);
-      await persistStats({ lastError: msg });
-      pump();
+    await sleep(600);
+    if (!state.activeTabs.has(tabId)) return;
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'FILL_FORM',
+        payload: job.payload,
+        runId: job.runId
+      });
+    } catch {
+      const curMeta = state.activeTabs.get(tabId);
+      if (curMeta) {
+        clearTimeout(curMeta.timeoutId);
+        state.activeTabs.delete(tabId);
+      }
+      state.tabJobs.delete(tabId);
+      try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
+      if (state.isRunning) {
+        state.stats.failed++;
+        const msg = `Form #${job.index ?? '?'}: không gửi được kịch bản tới tab, đã bỏ qua.`;
+        logError(job.index ?? '?', msg);
+        await persistStats({ lastError: msg });
+        pump();
+      }
     }
   }
 });
 
-// Tab bị user đóng tay -> dọn record, tránh kẹt bộ đếm active
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (state.activeTabs.has(tabId)) {
     const meta = state.activeTabs.get(tabId);
     clearTimeout(meta.timeoutId);
     state.activeTabs.delete(tabId);
-    state.pendingSend.delete(tabId);
-    await persistStats();
+    state.tabJobs.delete(tabId);
+    if (state.isRunning) {
+      state.stats.failed++;
+      const msg = `Form #${meta.index}: Tab bị đóng đột ngột trước khi hoàn tất.`;
+      logError(meta.index, msg);
+      await persistStats({ lastError: msg });
+      pump();
+      checkFinished();
+    } else {
+      await persistStats();
+    }
   }
 });
 
-// Chốt 1 tab (thành công/thất bại): kill tab ngay, ghi nhận, bơm tiếp.
-// Idempotent: tab đã chốt/timeout trước đó thì bỏ qua (tránh đếm trùng khi cả
-// URL formResponse lẫn FORM_DONE cùng tới).
 async function finalizeTab(tabId, ok, error) {
   const meta = state.activeTabs.get(tabId);
-  if (!meta) return false; // tab lạ / đã chốt / đã timeout
+  if (!meta) return false;
   clearTimeout(meta.timeoutId);
   state.activeTabs.delete(tabId);
-  state.pendingSend.delete(tabId);
+  state.tabJobs.delete(tabId);
   try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
   if (!state.isRunning) { await persistStats(); return true; }
 
@@ -281,10 +397,12 @@ async function finalizeTab(tabId, ok, error) {
   }
   await persistStats(ok ? {} : { lastError: `Form #${meta.index}: ` + error });
 
-  // Delay ngẫu nhiên Min–Max trước khi mở form tiếp theo trong queue
-  const d = randomDelayMs();
-  setTimeout(() => pump(), d);
   checkFinished();
+  if (state.isRunning && state.queue.length > 0) {
+    const d = randomDelayMs();
+    await sleep(d);
+    pump();
+  }
   return true;
 }
 
@@ -296,14 +414,14 @@ function checkFinished() {
   }
 }
 
-// Dừng khẩn cấp: hủy queue, đóng mọi tab, reset AI-strike
 async function abortAll(reason) {
   state.isRunning = false;
+  state.isPumping = false;
   state.abortReason = reason || 'Người dùng dừng khẩn cấp.';
   state.queue = [];
-  state.pendingSend.clear();
+  state.tabJobs.clear();
   const tabs = [...state.activeTabs.keys()];
-  for (const [tabId, meta] of state.activeTabs) clearTimeout(meta.timeoutId);
+  for (const [, meta] of state.activeTabs) clearTimeout(meta.timeoutId);
   state.activeTabs.clear();
   for (const tabId of tabs) {
     try { await chrome.tabs.remove(tabId); } catch { /* bỏ qua */ }
@@ -318,21 +436,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg?.type) {
       case 'START_RUN': {
-        if (state.isRunning) { sendResponse({ ok: false, error: 'Đang có phiên chạy, hãy dừng trước.' }); return; }
-        // API Key CHỈ lưu ở chrome.storage.session (tự xóa khi đóng trình duyệt)
-        await chrome.storage.session.set({ geminiApiKey: msg.apiKey || '' });
-        state.apiKey = msg.apiKey || '';
+        if (state.isRunning) {
+          sendResponse({ ok: false, error: 'Đang có phiên chạy, hãy dừng trước.' });
+          return;
+        }
+        const rawPayloads = msg.payloads || [];
         state.isRunning = true;
+        state.isPumping = false;
+        state.nextIndex = 0;
         state.runId = 'run_' + Date.now();
         state.formUrl = msg.formUrl;
-        state.queue = [...(msg.payloads || [])];
+        state.queue = [...rawPayloads];
         state.questionsMeta = msg.questionsMeta || {};
         state.stats = { total: state.queue.length, success: 0, failed: 0 };
-        state.errorLog = []; // reset nhật ký lỗi cho phiên chạy mới
-        state.apiErrorCount = 0;
+        state.errorLog = [];
         state.abortReason = null;
         state.delayMin = msg.delayMin;
         state.delayMax = msg.delayMax;
+
+        buildGridBasePools(rawPayloads);
+
         await persistStats({ total: state.stats.total });
         sendResponse({ ok: true, runId: state.runId });
         pump();
@@ -348,13 +471,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
       case 'FORM_DONE': {
-        if (msg.runId !== state.runId) { sendResponse({ ack: true }); return; }
+        if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
         await finalizeTab(sender.tab.id, true, null);
         sendResponse({ ack: true });
         break;
       }
       case 'FORM_SUBMITTED': {
-        // Content vừa bấm Submit -> đánh dấu + reset bộ đếm 30s chờ trang cảm ơn
         if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
         const meta = state.activeTabs.get(sender.tab.id);
         if (meta && state.isRunning) {
@@ -364,8 +486,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ack: true });
         break;
       }
+      case 'FORM_NEXT_PAGE':
       case 'FORM_HEARTBEAT': {
-        // Tab báo "vẫn sống, đang điền" -> reset bộ đếm timeout 30s của tab đó
         if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
         const meta = state.activeTabs.get(sender.tab.id);
         if (meta && state.isRunning) armTabTimeout(sender.tab.id, meta.index);
@@ -373,7 +495,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
       case 'FORM_ERROR': {
-        if (msg.runId !== state.runId) { sendResponse({ ack: true }); return; }
+        if (msg.runId !== state.runId || !sender.tab) { sendResponse({ ack: true }); return; }
         await finalizeTab(sender.tab.id, false, msg.error);
         sendResponse({ ack: true });
         break;
@@ -382,5 +504,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Unknown message' });
     }
   })();
-  return true; // giữ channel cho sendResponse async
+  return true;
 });
