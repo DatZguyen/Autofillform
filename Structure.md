@@ -1,151 +1,115 @@
-# CẤU TRÚC DỰ ÁN (PROJECT BLUEPRINT): GOOGLE FORMS AI AUTO-FILL & SUBMITTER
+# Structure
 
-## 1. TỔNG QUAN DỰ ÁN
-Một Chrome/Edge Extension (Manifest V3) chuyên dụng để tự động hóa việc điền và submit Google Forms với số lượng lớn. 
-Hệ thống sử dụng toán học để phân bổ tỷ lệ đáp án chính xác, tích hợp AI (Gemini) để đa dạng hóa câu trả lời văn bản, và chạy ngầm đa nhiệm tối đa 10 tab để tối ưu hiệu suất mà không làm treo trình duyệt.
+## Câu hỏi dạng LƯỚI (GRID) — tỷ lệ % riêng từng dòng con
 
-**Ràng buộc cốt lõi:**
-- Nền tảng hỗ trợ: Duy nhất Google Forms.
-- Không lưu trữ API Key cố định (sử dụng Session Storage).
-- Phải có cơ chế tự động thoát lỗi (Fail-Safe) để hệ thống chạy ổn định 24/7.
+### 1. Bóc tách (`scripts/content.js`)
 
----
+Sau khi parse `FB_PUBLIC_LOAD_DATA_`, một câu GRID có cấu trúc:
 
-## 2. CẤU TRÚC THƯ MỤC (DIRECTORY STRUCTURE)
+```js
+q.type        = 'GRID';
+q.options     = [ {t:'1'}, {t:'2'}, {t:'3'} ];          // danh sách CỘT
+q.gridRows    = ['Dòng A','Dòng B','Dòng C'];           // tên các DÒNG con
+q.gridRowIds  = ['r1','r2','r3'];                       // id từng dòng (rowEntry[0])
+q.gridRowsMeta= [ {index, id, label}, ... ];            // chi tiết từng dòng
+q.rowCount    = 3;
+q.gridKind    = 'RADIO' | 'CHECKBOX';                   // mỗi hàng chọn 1 / chọn nhiều
+```
 
-```text
-google-forms-auto-filler/
-│
-├── manifest.json           # Khai báo Manifest V3, permissions: tabs, storage, scripting, host_permissions (google.com, gemini api).
-│
-├── popup/
-│   ├── popup.html          # Giao diện chính (2 màn hình: Config và Tracking).
-│   ├── popup.css           # Style cho giao diện (hiện đại, gọn gàng).
-│   └── popup.js            # Lắng nghe sự kiện UI, gửi message cho Background.
-│
-├── scripts/
-│   ├── background.js       # (Service Worker) Quản lý Queue, gọi Gemini API, xử lý Delay, quản lý Vòng đời Tab.
-│   └── content.js          # Chạy trên tab Google Forms: Extract dữ liệu ẩn, giả lập click/nhập text và submit.
-│
-└── assets/
-    └── icons/
-        ├── icon16.png
-        ├── icon48.png
-        └── icon128.png
+Nguồn nhãn dòng con (theo thứ tự ưu tiên):
 
+| Vị trí trong `entry[4][i]` | Ý nghĩa |
+|---|---|
+| `rowEntry[3][0]` | nhãn hiển thị của dòng (phổ biến nhất) |
+| `rowEntry[1][0][0]` | fallback — một số phiên bản lưu ở cột options |
+| `rowEntry[1]` (string) | fallback |
+| `rowEntry[0]` | **id** của dòng (không phải nhãn) |
 
-        3. ĐẶC TẢ KỸ THUẬT VÀ THUẬT TOÁN (CORE MECHANISMS)
-3.1. Trích xuất Cấu trúc Form (Form Extraction)
-Tuyệt đối KHÔNG dùng phương pháp cào dữ liệu (crawler) qua từng trang.
+Nếu FB data không lộ dòng con → fallback lấy từ DOM
+(`div[role="radiogroup"]` / `div[role="group"]` có `aria-label` = tên dòng).
 
-Cách làm: content.js quét mã nguồn HTML của trang form ngay khi tải xong, tìm thẻ <script> có chứa biến toàn cục FB_PUBLIC_LOAD_DATA_.
+`gridKind` được nhận diện từ DOM (`div[role="checkbox"]` vs `div[role="radio"]`),
+mặc định `'RADIO'`. Lúc điền, `fillGrid()` vẫn tự phát hiện lại theo DOM thực tế.
 
-Mục đích: Parse chuỗi JSON này để lấy TẤT CẢ: Question ID, Tiêu đề, Loại câu hỏi (Radio, Checkbox, Text), và danh sách Lựa chọn, bao gồm cả những câu hỏi nằm ở các trang (section) bị ẩn.
+### 2. Giao diện (`popup/popup.js` — `renderGridBlock`)
 
-Luồng dữ liệu: content.js -> gửi JSON data -> popup.js để render ra giao diện Config.
+- Tiêu đề chính của GRID là **group header**.
+- Mỗi **dòng con** = 1 khối cấu hình độc lập: đầy đủ ô `%` cho từng cột,
+  kèm thanh "Còn lại: %" + nút 🎲 (ngẫu nhiên) / ⚖ (chia đều) **riêng của dòng đó**.
+- Thanh công cụ của khối GRID:
+  - `📋 Áp dụng tỷ lệ dòng 1 cho tất cả các dòng trong bảng này` — copy % dòng đầu sang mọi dòng.
+  - `⚖ Chia đều mọi dòng` · `🎲 Ngẫu nhiên mọi dòng`.
+  - `▾ Thu gọn` — dùng `max-height` (KHÔNG dùng `display:none`) để `offsetParent`
+    vẫn khác `null`, nên phần trăm "Còn lại" vẫn tính đúng khi đang thu gọn.
 
-3.2. Thuật toán Phân bổ (Largest Remainder Method)
-Đảm bảo khi chia tỷ lệ %, tổng số form thực tế không bao giờ bị lệch (thiếu/thừa) so với số lượng cấu hình.
+DOM sinh ra (dùng cho Lưu/Tải cấu hình):
 
-Logic thực thi:
+```html
+<div class="grid-row" data-row="Dòng A">
+  <input class="pct-input" data-opt="1" data-row="Dòng A" />
+  <input class="pct-input" data-opt="2" data-row="Dòng A" />
+  ...
+</div>
+```
 
-Tính số lượng lý thuyết cho từng đáp án: Số form = Tổng số form * (Tỷ lệ % / 100).
+### 3. Đóng gói payload (`popup/popup.js` — `onStart`)
 
-Lấy phần nguyên gán làm số lượng mặc định.
+Mỗi dòng con có **1 bộ `largestRemainder(pcts, total)` riêng**
+(Largest Remainder + Fisher-Yates shuffle) → số lượng mỗi cột trên mừng dòng luôn
+khớp **chính xác** tỷ lệ đã khai báo, còn thứ tự submit vẫn ngẫu nhiên.
 
-Lấy phần thập phân (số dư) của các lựa chọn.
+```js
+one[qid] = {
+  kind: 'choice',
+  value: {
+    __rowAnswers: ['3','1','2'],   // theo đúng thứ tự dòng
+    'Dòng A': '3',                 // ánh xạ theo tên dòng
+    'Dòng B': '1',
+    'Dòng C': '2',
+  },
+};
+```
 
-Thiếu bao nhiêu form, sẽ cộng thêm 1 vào các lựa chọn có phần thập phân từ cao xuống thấp cho đến khi đủ tổng số form.
+### 4. Truyền payload (`scripts/background.js` — `resolvePayload`)
 
-Kết quả: Trả về một mảng chứa N "Kịch bản" (Mỗi kịch bản là 1 object mapping Question ID -> Giá trị trả lời).
+| `spec.value` | Hành động |
+|---|---|
+| Object (có `__rowAnswers` hoặc map theo tên dòng) | **truyền nguyên vẹn** |
+| Array (đáp án theo thứ tự dòng) | **truyền nguyên vẹn** |
+| Giá trị đơn (cấu hình cũ) | fallback `drawGridRowAnswers()` — rút ngẫu nhiên cho từng dòng |
 
-3.3. Tích hợp AI (Gemini 2.5 Flash API)
-Bảo mật: API Key do người dùng nhập ở Popup, lưu bằng chrome.storage.session (tự hủy khi đóng trình duyệt).
+### 5. Điền form (`scripts/content.js` — `fillGrid`)
 
-Custom Prompt & Spintax:
+Thứ tự ưu tiên khoá đáp án cho 1 dòng:
 
-Hỗ trợ biến {{question}} để chèn tự động câu hỏi của form.
+1. **Câu hỏi bẫy (Attention check)** — VD *"Vui lòng chọn mức 4…"* → luôn ưu tiên vượt qua bẫy.
+2. **Khớp theo tên dòng** — `answer[rowLabel]`.
+3. **Khớp theo index** — `answer.__rowAnswers[i]` hoặc `answer[i]`.
 
-Hỗ trợ Spintax {A|B|C} để tạo ngẫu nhiên bối cảnh.
+Nếu không xác định được đáp án → chọn ngẫu nhiên 1 giá trị khả dụng của dòng.
 
-Ví dụ: {Hãy đóng vai sinh viên|Hãy đóng vai người đi làm}, trả lời ngắn gọn: {{question}} -> background.js sẽ parse ra 1 prompt ngẫu nhiên trước khi gọi API.
+### 6. Lưu / Tải cấu hình (Preset)
 
-Lưu ý: Chỉ gọi API ở background.js để tránh bị lỗi CORS.
+`collectConfig()` / `applyConfig()` lưu theo schema:
 
-3.4. Quản lý Đa nhiệm (10-Tab Concurrency Queue)
-Giới hạn: Mở tối đa 10 tab ẩn (chrome.tabs.create({ active: false, url: formUrl })) tại cùng một thời điểm.
+```js
+questions: {
+  [qid]: {
+    type: 'GRID',
+    grid: {                       // % RIÊNG của từng dòng con
+      'Dòng A': { '1': 10, '2': 20, '3': 70 },
+      'Dòng B': { '1': 70, '2': 20, '3': 10 },
+    },
+  },
+}
+```
 
-Quy trình Hàng đợi (Queue):
+Lưu trong `chrome.storage.local` (`formAutoFillPresets`) → tỷ lệ % riêng của từng dòng con
+được giữ nguyên khi lưu/tải lại cấu hình.
 
-Background bốc 10 kịch bản đầu tiên, mở 10 tab.
+### 7. Kiểm thử
 
-content.js trong từng tab nhận kịch bản, giả lập thao tác điền form và Submit.
-
-Báo cáo kết quả về Background.
-
-Background đóng tab đó (chrome.tabs.remove), áp dụng một khoảng Delay ngẫu nhiên (Min - Max do user cấu hình), sau đó bốc kịch bản tiếp theo mở tab mới.
-
-Quá trình lặp lại cho đến khi hết mảng kịch bản.
-
-3.5. Xử lý Thao tác DOM (Auto-Fill Execution)
-Google Forms KHÔNG dùng chuẩn HTML thông thường. content.js phải xử lý như sau:
-
-Radio/Checkbox: Tìm các thẻ div[role="radio"] hoặc div[role="checkbox"] chứa data-value khớp với kịch bản, gọi hàm .click().
-
-Text/Textarea: Điền .value, sau đó bắt buộc phải dispatchEvent(new Event('input', {bubbles: true})) và dispatchEvent(new Event('change', {bubbles: true})) để React/JS của Google Forms ghi nhận dữ liệu.
-
-Tiến trình: Click nút "Tiếp" (Next) nếu có, lặp lại việc điền cho đến khi thấy nút "Gửi" (Submit) thì click Submit.
-
-4. QUẢN LÝ RỦI RO & BẮT LỖI (FAIL-SAFE PROTOCOLS)
-Đây là các quy tắc bắt buộc để hệ thống không bị treo vô hạn:
-
-Timeout 30s (Form Kẹt):
-
-Khi background.js mở 1 tab điền form, nó bắt đầu đếm giờ.
-
-Nếu qua 30 giây mà content.js chưa báo "Thành công", tab đó coi như kẹt (do Captcha, rớt mạng, lag).
-
-Hành động: background.js ép đóng tab, đánh dấu form đó là Skipped (Bỏ qua), và chạy form tiếp theo. Không dừng hệ thống.
-
-The 3-Strike API Rule (Lỗi Gemini):
-
-Tạo biến apiErrorCount = 0 trong background.js.
-
-Mỗi lần fetch API Gemini bị Timeout hoặc Trả về lỗi, apiErrorCount++. Fetch thành công, apiErrorCount = 0.
-
-Nếu apiErrorCount === 3: Lỗi hệ thống diện rộng.
-
-Hành động: Lập tức Abort (Hủy) toàn bộ Hàng đợi, đóng tất cả 10 tab đang chạy, hiển thị thông báo lỗi lên giao diện người dùng.
-
-5. THIẾT KẾ GIAO DIỆN (UI/UX)
-Giao diện popup.html được chia làm 2 màn hình (View):
-
-View 1: Configuration (Cấu hình)
-
-Khung nhập Gemini API Key.
-
-Danh sách câu hỏi (được render động từ content script gửi về).
-
-Câu trắc nghiệm: Các ô input nhập % cho từng đáp án (tổng phải validate = 100%).
-
-Câu văn bản: Toggle bật/tắt AI. Nếu bật: Hiện ô nhập Spintax Prompt. Nếu tắt: Hiện ô nhập text tĩnh.
-
-Cài đặt hệ thống: Tổng số form cần điền, Delay Min (phút), Delay Max (phút).
-
-Nút Action: "BẮT ĐẦU CHẠY".
-
-View 2: Tracking Dashboard (Giám sát)
-
-Progress bar (Thanh tiến độ %).
-
-Bảng thống kê Real-time:
-
-Tổng Yêu Cầu: N
-
-Thành Công: X
-
-Bỏ Qua (Lỗi/Timeout): Y
-
-Đang Chạy: Z (Max 10).
-
-Nút Action: "DỪNG KHẨN CẤP" (Ngắt toàn bộ hàng đợi và đóng tab).
+```bash
+npm test     # gồm tests/grid.test.js + tests/grid-ui.test.js
+npm run lint
+```

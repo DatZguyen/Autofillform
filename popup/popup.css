@@ -1,4 +1,4 @@
-/* Forms AI Auto-Fill — Popup style (nhỏ gọn, tiếng Việt) */
+/* Forms Auto-Fill — Popup style (nhỏ gọn, tiếng Việt) */
 * { box-sizing: border-box; }
 body {
   width: 420px; max-height: 600px; overflow-y: auto;
@@ -28,6 +28,15 @@ section { padding: 12px 14px; }
 .q-type {
   display: inline-block; font-size: 10px; background: #ede7f6; color: #4527a0;
   padding: 1px 7px; border-radius: 10px; margin-bottom: 6px;
+}
+.q-meta { display: flex; gap: 6px; flex-wrap: wrap; margin: -2px 0 6px; }
+.q-page {
+  font-size: 10px; background: #e3f2fd; color: #0d47a1;
+  padding: 1px 7px; border-radius: 10px; font-weight: 600;
+}
+.q-req {
+  font-size: 10px; background: #fdecea; color: #b71c1c;
+  padding: 1px 7px; border-radius: 10px; font-weight: 600;
 }
 .opt-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .opt-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -69,27 +78,70 @@ label { display: block; margin: 8px 0 2px; font-weight: 600; }
 }
 .stat b { font-size: 18px; }
 .stat.ok b { color: #2e7d32; } .stat.err b { color: #c62828; } .stat.run b { color: #e65100; }
-.ai-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-weight: 600; }
-/* --- Khối prompt AI (ẩn cho tới khi tick "Dùng Gemini AI") --- */
-.prompt-wrap {
-  background: #f3e8fd; border: 1px dashed #673ab7;
-  border-radius: 6px; padding: 8px; margin: 6px 0;
+.stat.skip b { color: #6a1b9a; }
+/* --- GRID: mỗi dòng con 1 bộ % riêng --- */
+.grid-toolbar {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 6px 0 8px; padding: 6px;
+  background: #f3e8fd; border: 1px dashed #673ab7; border-radius: 6px;
 }
-.prompt-wrap textarea { background: #fff; }
-/* --- Danh sách biến thể câu trả lời cho câu nhập liệu --- */
-.variant-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
-.variant-row .variant-text { flex: 1; width: auto; min-width: 0; }
-.variant-row .variant-pct { width: 60px; flex: none; }
+.grid-toolbar .rand-btn { font-size: 11.5px; padding: 4px 8px; }
+.grid-rows {
+  display: flex; flex-direction: column; gap: 8px;
+  transition: max-height .25s ease, opacity .2s ease;
+  max-height: 4000px; opacity: 1;
+}
+/* Thu gọn bằng max-height (KHÔNG dùng display:none) để offsetParent vẫn khác null
+   -> phần trăm "Còn lại" của từng dòng vẫn tính đúng khi đang thu gọn. */
+.grid-rows.collapsed { max-height: 0; opacity: 0; overflow: hidden; }
+.grid-row {
+  border: 1px solid #e0e0e0; border-left: 3px solid #673ab7;
+  border-radius: 6px; padding: 6px 8px; background: #fafafa;
+}
+.grid-row-head {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px;
+}
+.grid-row-idx {
+  font-size: 10px; font-weight: 700; color: #4527a0;
+  background: #ede7f6; padding: 1px 6px; border-radius: 8px; flex: none;
+}
+.grid-row-name {
+  font-weight: 700; font-size: 12.5px; color: #202124;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+.grid-row .pct-bar { margin-top: 4px; padding-top: 4px; }
+.grid-row .opt-row { margin: 2px 0; }
+.grid-row .opt-row span { font-size: 12px; }
+
+/* --- Lưu / Tải cấu hình (Preset) --- */
+.preset-box {
+  background: #fff; border: 1px solid #dadce0; border-radius: 8px;
+  padding: 10px; margin-bottom: 12px;
+}
+.preset-box legend { font-weight: 700; color: #673ab7; padding: 0 6px; }
+.preset-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.preset-row > input, .preset-row > select { flex: 1; min-width: 0; }
+.preset-row select {
+  width: 100%; padding: 6px 8px; border: 1px solid #dadce0;
+  border-radius: 6px; font-size: 13px; font-family: inherit; background: #fff;
+}
+.btn.mini {
+  width: auto; flex: none; margin-top: 0; padding: 6px 10px;
+  font-size: 12px; font-weight: 600; border-radius: 6px;
+  background: #ede7f6; color: #4527a0; border: 1px solid #d1c4e9; cursor: pointer;
+}
+.btn.mini:hover { background: #d1c4e9; }
+.btn.mini.danger { background: #fce8e6; color: #c62828; border-color: #f5c6cb; }
+.btn.mini.danger:hover { background: #f8d7da; }
+
+/* --- Ô nhập danh sách đáp án (textarea nhiều dòng: mỗi dòng 1 đáp án) --- */
+.text-answers {
+  width: 100%; min-height: 84px; resize: vertical;
+  font-family: "Consolas", "Courier New", monospace; font-size: 12.5px;
+  line-height: 1.45; white-space: pre;
+}
+.ans-count { margin-top: 3px; font-weight: 600; color: #4527a0; }
 .pct-lb { flex: none; color: #5f6368; }
-.mini-btn {
-  flex: none; border: 1px solid #dadce0; background: #fff; border-radius: 6px;
-  cursor: pointer; padding: 4px 8px; color: #c62828; font-size: 12px;
-}
-.mini-btn:hover { background: #fce8e6; }
-.btn.add-btn {
-  background: #fff; color: #673ab7; border: 1px dashed #673ab7;
-  font-size: 12px; padding: 6px;
-}
 /* --- Thanh "Còn lại %" + nút chia ngẫu nhiên --- */
 .pct-bar {
   display: flex; align-items: center; gap: 8px;
@@ -104,9 +156,17 @@ label { display: block; margin: 8px 0 2px; font-weight: 600; }
 }
 .rand-btn:hover { background: #d1c4e9; }
 .rand-msg { display: block; margin-top: 2px; min-height: 14px; }
-/* --- Ô nhập nội dung cho đáp án "Mục khác:" --- */
-.other-text-wrap { background: #fff8e1; border-radius: 6px; padding: 4px 6px; }
-.other-text-wrap .other-text { flex: 1; width: auto; min-width: 0; }
+/* --- Ô nhập nội dung cho đáp án "Mục khác:" (mỗi dòng 1 nội dung) --- */
+.other-text-wrap {
+  background: #fff8e1; border: 1px solid #ffe082;
+  border-radius: 6px; padding: 6px; margin: 6px 0;
+}
+.other-text-wrap .hint { margin-bottom: 3px; }
+.other-text-wrap .other-text {
+  width: 100%; min-height: 46px; resize: vertical;
+  font-family: "Consolas", "Courier New", monospace; font-size: 12.5px;
+  line-height: 1.45; white-space: pre;
+}
 /* --- Danh sách lỗi chi tiết --- */
 .err-head { font-weight: 700; margin: 8px 0 4px; color: #c62828; }
 .err-list {

@@ -1,17 +1,25 @@
 {
   "manifest_version": 3,
-  "name": "Google Forms AI Auto-Fill & Submitter",
-  "version": "1.0.0",
-  "description": "Tu dong boc tach Google Forms, phan bo ty le %, sinh cau tra loi bang Gemini AI va submit hang loat da nhiem (toi da 10 tab an).",
+  "name": "Google Forms Auto-Fill & Submitter",
+  "version": "1.2.0",
+  "description": "Tu dong boc tach Google Forms (multi-page, ranh nhanh), phan bo ty le dap an, chon random noi dung nhap lieu va submit hang loat da nhiem (toi da 10 tab an).",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "Forms AI Auto-Fill"
+    "default_title": "Forms Auto-Fill",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
   },
   "permissions": ["tabs", "storage", "scripting"],
   "host_permissions": [
-    "https://docs.google.com/*",
-    "https://www.google.com/*",
-    "https://generativelanguage.googleapis.com/*"
+    "https://docs.google.com/*"
   ],
   "background": {
     "service_worker": "scripts/background.js"
@@ -20,7 +28,8 @@
     {
       "matches": ["https://docs.google.com/forms/*"],
       "js": ["scripts/content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ]
 }
